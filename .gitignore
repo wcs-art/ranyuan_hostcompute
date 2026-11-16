@@ -1,0 +1,72 @@
+# Runtime outputs
+/Result/
+/logs/
+/capture/
+sleep_record_*.csv
+*.edf
+*.snirf
+*.xdf
+
+# Sample inputs
+/Sample/
+
+# PyInstaller outputs
+/build/
+/dist/
+
+*.spec.bak
+
+# Local backup folders
+/Host_computer_6_nested_backup_*/
+
+# Python cache
+__pycache__/
+**/__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# IDE / editor
+.idea/
+.vscode/
+.cursor/
+
+# 录制样本 (单文件 13-20MB, 不入库; 需要时用 tools/ 下脚本重新生成)
+sleep_record_*.csv
+sleep_record_*.edf
+sleep_record_*.snirf
+sleep_record_*.xdf
+verify_center.edf
+verify_center.xdf
+
+# 临时草稿 (需求比对过程的中间输出)
+ctx*.txt
+req_orig.txt
+req_self.txt
+req_check.txt
+
+# 临时日志
+*.log
+
+# ---------------------------------------------------------------
+# 入库范围：只收代码主体 + README.md
+# 以下均为本地工作文档 / AI 协作产物，按约定不入库（文件仍保留在本地磁盘）
+# ---------------------------------------------------------------
+
+# 内部文档（架构说明、协议、调试手册、台账、合同提取等一律不入库）
+/ARCHITECTURE.md
+/docs/
+/design/
+/packaging/README_packaging.md
+
+# AI 协作产物：工作记忆 与 表述/引用检查脚本
+/.workbuddy/
+/tools/check_claims.py
+/tools/check_refs.py
+/tests/test_claims_discipline.py
+/tests/test_doc_refs.py
+
