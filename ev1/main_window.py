@@ -8,9 +8,10 @@ from PyQt5 import QtWidgets, QtCore
 class ClassicMainWindow(QtWidgets.QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("燃元科技数据采集显示上位机")
+        self._base_title = "燃元科技数据采集显示上位机"
+        self.setWindowTitle(self._base_title)
         self.resize(1600, 950)
-        self.source = None          # 由 main() 注入, 用于读链路统计
+        self.source = None          # 由 main() 注入或界面"连接"按钮创建, 用于读链路统计
         self._link_t0 = time.time()
         cw = QtWidgets.QWidget(); self.setCentralWidget(cw)
         # ---- 左: 波形区 ----
@@ -116,6 +117,35 @@ class ClassicMainWindow(QtWidgets.QMainWindow):
         bl = QtWidgets.QHBoxLayout(bottom)
         self.log = QtWidgets.QListWidget(); self.log.setMaximumHeight(110)
         bl.addWidget(self.log, stretch=3)
+
+        # ---- 链路连接：换线/换口不必重启程序, 也不必改 config/run.json ----
+        conn_box = QtWidgets.QVBoxLayout()
+        self.cmb_src = QtWidgets.QComboBox()
+        for label, key in (("文本串口 (有线 FireWater)", "text"),
+                           ("二进制串口 (AA55 帧)", "serial"),
+                           ("UDP 网络", "udp"),
+                           ("TCP 服务端", "tcp-client"),
+                           ("模拟数据 (仅自检)", "sim")):
+            self.cmb_src.addItem(label, key)
+        self.cmb_com = QtWidgets.QComboBox(); self.cmb_com.setEditable(True)
+        self.cmb_com.setMinimumWidth(90)
+        self.cmb_baud = QtWidgets.QComboBox(); self.cmb_baud.setEditable(True)
+        self.cmb_baud.addItems(["921600", "460800", "230400", "115200"])
+        self.btn_scan = QtWidgets.QPushButton("刷新端口")
+        self.btn_scan.clicked.connect(self._rescan_ports)
+        self.btn_conn = QtWidgets.QPushButton("▶ 连接并采集")
+        self.btn_conn.setMinimumSize(120, 60)
+        self.btn_conn.setStyleSheet("font-weight:bold;")
+        self.btn_conn.clicked.connect(self._toggle_link)
+        r1 = QtWidgets.QHBoxLayout(); r1.addWidget(self.cmb_src, stretch=2)
+        r1.addWidget(self.cmb_baud, stretch=1)
+        r2 = QtWidgets.QHBoxLayout(); r2.addWidget(self.cmb_com, stretch=1)
+        r2.addWidget(self.btn_scan)
+        conn_box.addLayout(r1); conn_box.addLayout(r2)
+        bl.addLayout(conn_box, stretch=2)
+        bl.addWidget(self.btn_conn)
+        self._rescan_ports()
+
         rec_box = QtWidgets.QVBoxLayout()
         self.btn_record = QtWidgets.QPushButton("● 开始记录 (S2)")
         self.btn_record.setCheckable(True)
@@ -159,6 +189,113 @@ class ClassicMainWindow(QtWidgets.QMainWindow):
         self._t_link = QtCore.QTimer(); self._t_link.timeout.connect(self._refresh_link)
         self._t_link.start(500)
 
+    # ---------------- 链路连接 ----------------
+    def _rescan_ports(self):
+        """扫描本机串口。没装 pyserial 时保留手输口名，不当成错误。"""
+        cur = self.cmb_com.currentText().strip()
+        ports = []
+        try:
+            from serial.tools import list_ports
+            ports = [p.device for p in list_ports.comports()]
+        except Exception as e:  # noqa: BLE001 - 缺依赖不该让界面挂掉, 但要说出来
+            self._say(f"[WARN] 串口列表不可用({type(e).__name__})，可手输口名如 COM3", False)
+        self.cmb_com.clear()
+        self.cmb_com.addItems(ports or ["COM3"])
+        if cur and cur not in ports:
+            self.cmb_com.addItem(cur)
+        if cur:
+            self.cmb_com.setCurrentText(cur)
+        self._say(f"串口列表: {', '.join(ports) if ports else '未发现（可手输）'}")
+
+    def _toggle_link(self):
+        if self.source is None:
+            self._connect()
+        else:
+            self._disconnect()
+
+    def _connect(self):
+        """按界面选项建链路并开采集。失败原因直接显示在链路行，不让窗口空着。"""
+        kind = self.cmb_src.currentData()
+        com = self.cmb_com.currentText().strip() or "COM3"
+        try:
+            baud = int(self.cmb_baud.currentText().strip() or 921600)
+        except ValueError:
+            self._say(f"[FAIL] 波特率不是整数: {self.cmb_baud.currentText()!r}", False)
+            return
+        self._disconnect(silent=True)
+        from source import make_source
+        self.mon.extra_cols = False
+        try:
+            src = make_source(kind, com=com, baud=baud, port=5000, host="0.0.0.0",
+                              proto=("serial" if kind == "serial" else "udp"))
+            src.start()
+        except Exception as e:  # noqa: BLE001 - 打不开端口是最常见的现场故障
+            self._say(f"[FAIL] 连接失败({kind}): {e}", False)
+            self.lbl_link.setText(f"链路: 打开失败 — {e}")
+            self.lbl_link.setStyleSheet("color:#b00020;")
+            return
+        self._install_source(src)
+        where = f"{com} @{baud}" if kind in ("text", "serial") else kind
+        self._say(f"[OK] 已连接: {self.cmb_src.currentText()} — {where}")
+        if kind in ("text", "serial"):
+            # 现场最容易犯的一条：VOFA/串口助手和上位机同时开同一个口。
+            # 驱动允许两个句柄，但字节会被分流，出来的是跳变脏值, 不是传感器数据。
+            self._say("[注意] 同一 COM 口若被 VOFA 等工具同时打开，数据会被分流成跳变脏值；"
+                      "测完整波形前请先断开那些工具", False)
+
+    def _disconnect(self, silent: bool = False):
+        if self.source is not None:
+            try:
+                self.source.stop()
+            except Exception as e:  # noqa: BLE001
+                self._say(f"[WARN] 关闭链路异常: {e}", False)
+        self.source = None
+        self.mon.detach_receiver()
+        self.setWindowTitle(self._base_title)
+        for i, p in enumerate(self.mon.plots[:self.mon.n_eeg]):
+            p.setTitle(self.mon.eeg_names[i])
+        self.lbl_link.setText("链路: 未连接（选好类型和端口后点「连接并采集」）")
+        self.lbl_link.setStyleSheet("color:#666666;")
+        if hasattr(self, "btn_conn"):
+            self.btn_conn.setText("▶ 连接并采集")
+        if not silent:
+            self._say("已断开数据源")
+
+    def _install_source(self, src):
+        """接管一个已启动的数据源：清旧缓冲、挂到波形区、按格式加标注。"""
+        self.source = src
+        self.mon.attach_receiver(src)
+        kind = getattr(src, "kind", "")
+        title = self._base_title
+        for i, p in enumerate(self.mon.plots[:self.mon.n_eeg]):
+            p.setTitle(self.mon.eeg_names[i])
+        if kind == "sim":
+            title += "  【模拟数据 · 非真机】"
+        elif kind in ("text", "text-file"):
+            # 文本格式不带 CRC/序号/时间戳, 单位也未换算: 必须写在标题栏,
+            # 否则会被当成"14 通道全功能已跑通"
+            title += "  【文本原始值 · 未换算 · 无 CRC/丢包校验】"
+            for i, p in enumerate(self.mon.plots[:self.mon.n_eeg]):
+                p.setTitle(f"CH{i+1}（原始值）")
+        self.setWindowTitle(title)
+        self.btn_conn.setText("■ 断开")
+
+    def _sync_ui_to_source(self, src):
+        """把界面下拉框对齐到实际在跑的链路，否则点了「断开」再「连接」会换错链路。"""
+        kind = getattr(src, "kind", "")
+        if kind == "real":
+            proto = getattr(src, "proto", "udp")
+            kind = "serial" if proto == "serial" else proto
+        idx = self.cmb_src.findData(kind)
+        if idx >= 0:
+            self.cmb_src.setCurrentIndex(idx)
+        com = getattr(src, "com", None) or getattr(getattr(src, "_rx", None), "port", None)
+        if com:
+            self.cmb_com.setCurrentText(str(com))
+        baud = getattr(src, "baud", None)
+        if baud:
+            self.cmb_baud.setCurrentText(str(int(baud)))
+
     def _refresh_link(self):
         """刷新链路行：区分「没有包」「有包但没帧」「有错误」三种情况。"""
         if self.source is None:
@@ -183,7 +320,8 @@ class ClassicMainWindow(QtWidgets.QMainWindow):
         elif link == "serial":
             extra = ""
         else:
-            extra = f" @端口{getattr(self.source, '_rx', None) and getattr(self.source._rx, 'port', '')}"
+            port = getattr(getattr(self.source, "_rx", None), "port", None)
+            extra = f" @{port}" if port else ""
 
         base = (f"链路: {link}{extra} | 收包 {pkts} 个 / {st.get('bytes', 0)} 字节 | "
                 f"解出 {frames} 帧 | {fps:.1f} Hz")
@@ -434,23 +572,15 @@ def main(source=None, extra_cols: bool = False):
     app = QtWidgets.QApplication(sys.argv)
     w = ClassicMainWindow()
     if source is not None:
-        w.source = source
         w.mon.extra_cols = bool(extra_cols)
         try:
             source.start()          # 幂等: main() 里可能已经开过
         except Exception as e:      # noqa: BLE001 - 让窗口照开, 原因显示在链路栏
             w._say(f"[FAIL] 链路启动失败: {e}", False)
-        w.mon.attach_receiver(source)
-        # 合成数据必须一眼可辨, 否则现场会把它当成真机波形
-        kind = getattr(source, "kind", "")
-        if kind == "sim":
-            w.setWindowTitle(w.windowTitle() + "  【模拟数据 · 非真机】")
-        elif kind in ("text", "text-file"):
-            # 文本格式不带 CRC/序号/时间戳, 单位也未换算: 这三件事必须写在标题栏上,
-            # 否则会被当成"14 通道全功能已跑通"
-            w.setWindowTitle(w.windowTitle() + "  【文本原始值 · 未换算 · 无 CRC/丢包校验】")
-            for i, p in enumerate(w.mon.plots[:w.mon.n_eeg]):
-                p.setTitle(f"CH{i+1}（原始值）")
+        w._install_source(source)
+        w._sync_ui_to_source(source)
+    else:
+        w._say("未接入数据源：选好类型与端口后点「连接并采集」")
     w.showMaximized()
     sys.exit(app.exec_())
 

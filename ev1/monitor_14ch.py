@@ -462,8 +462,30 @@ class Monitor14(QtWidgets.QMainWindow):
             fs = f'<span style="color:{c["正常"]}">全部正常 {len(self.fnirs_quality)}/{len(self.fnirs_quality)}</span>'
         self.lbl_quality.setText(f"<b>EEG</b> {eeg} &nbsp;|&nbsp; <b>fNIRS</b> {fs}")
 
+    def reset_buffers(self):
+        """换数据源前清空波形与分析状态，避免上一条链路的旧数据混进新曲线。"""
+        self.buf_eeg[:] = 0.0
+        self.buf_fn[:] = 0.0
+        self.buf_raw[:] = 0.0
+        self._seq_last = -1
+        self._lost = 0
+        self._recv = 0
+        self._sim_seq = 0
+        self.fs_measured = 0.0
+        self._fs_snapped = False      # 换源后重新按实测帧率校准
+        self.eeg_scale = 100.0
+        self.eeg_quality = ["--"] * self.n_eeg
+        self.fnirs_quality = ["--"] * 10
+
+    def detach_receiver(self):
+        """断开数据源：之后不再产生任何数据（不造数）。"""
+        self._receiver = None
+        self.sim = False
+        self.unit_unknown = False
+
     def attach_receiver(self, receiver):
         """接实机：receiver 需提供 poll_frames()，调用后界面改为读设备数据。"""
+        self.reset_buffers()
         self._receiver = receiver
         self.sim = False
         # 文本链路给的是未换算的原始值（单位未确认）。它的值域和 μV 差上千倍，

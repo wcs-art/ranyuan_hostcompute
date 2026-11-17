@@ -9,7 +9,7 @@
   "_增益": "eeg_gain / eeg_vref 必须与 ADS1299 寄存器实际配置一致, 否则所有 EEG 数值按比例错。合同 F2 要求折算系数随增益联动",
   "_前置增益": "eeg_preamp_gain = INA333 的 G(合同 A3: 1000±5%, 硬件固定)。显示与落盘的值要折算到电极输入端, 必须除以它; 填错就是所有 EEG 数值按比例错",
 
-  "source": "real",
+  "source": "text",
   "proto": "udp",
   "port": 5000,
   "host": "0.0.0.0",
