@@ -336,3 +336,59 @@ def test_fixed_window_mode_keeps_zero(mon):
     mon.btn_clock.setChecked(False)
     assert _xrange(mon.plots[0]) == (0.0, 10.0)
     assert "固定窗口" in mon.btn_clock.text()
+
+
+def test_zoom_out_reveals_history(mon):
+    """缩出去要能看到更早的数据，而不是只留中间一段。
+
+    现场现象：横轴 210~255，曲线只占 240~250，前面一片空白 —— 因为绘图点数
+    固定取 win*fs，跟视图范围无关，缩放只能看到"当前窗口"这一截。
+    """
+    mon.fs_eeg = mon.fs_fnirs = 100.0
+    _push(mon, [-120300.0 + (i % 5) for i in range(4000)])      # 40 s
+    assert len(mon.curves[0].getData()[0]) == 1000              # 跟随时只画 10 s
+    mon.plots[0].setXRange(10.0, 40.0, padding=0)               # 用户滚轮缩小
+    mon._on_manual_zoom()
+    mon._tick(force=True)
+    x = mon.curves[0].getData()[0]
+    assert len(x) == 3000, f"缩到 30 s 只画了 {len(x)} 点"
+    assert round(float(x[0]), 1) == 10.0 and round(float(x[-1]), 1) == 40.0
+
+
+def test_view_is_pulled_back_into_data(mon):
+    """缩/拖到没有数据的区间时，视图要被拉回来——不许留空白段。
+
+    现场现象：横轴 210~255，曲线只在 240~250，两端空白，看着像数据断了。
+    """
+    mon.fs_eeg = mon.fs_fnirs = 100.0
+    _push(mon, [-120300.0] * 2000)                              # 只有 20 s
+    mon.plots[0].setXRange(100.0, 160.0, padding=0)             # 整段都在数据之后
+    mon._on_manual_zoom()
+    mon._tick(force=True)
+    lo, hi = _xrange(mon.plots[0])
+    assert (lo, hi) == (0.0, 20.0), f"视图没被拉回数据区间: {(lo, hi)}"
+    x = mon.curves[0].getData()[0]
+    assert len(x) == 2000, f"拉回后应铺满 2000 点，实际 {len(x)}"
+    assert round(float(x[0]), 2) == 0.0 and round(float(x[-1]), 2) == 19.99
+
+
+def test_zoom_out_beyond_buffer_stops_at_oldest_sample(mon):
+    """缩到比缓冲还长时停在最老样本，右端对齐最新一帧，全轴都有数据。"""
+    mon.fs_eeg = mon.fs_fnirs = 100.0
+    _push(mon, [-120300.0] * 4000)                              # 40 s，缓冲 15000 点=150 s
+    mon.plots[0].setXRange(0.0, 400.0, padding=0)
+    mon._on_manual_zoom()
+    mon._tick(force=True)
+    lo, hi = _xrange(mon.plots[0])
+    assert hi == 40.0 and lo == 0.0, f"缩过头后视图应为 (0,40): {(lo, hi)}"
+
+
+def test_zoom_is_shared_by_all_plots(mon):
+    """缩一张，14 张一起走：否则同一时刻各图显示的是不同时间段的数据。"""
+    mon.fs_eeg = mon.fs_fnirs = 100.0
+    _push(mon, [-120300.0] * 3000)
+    mon.plots[3].setXRange(5.0, 15.0, padding=0)
+    mon._on_manual_zoom(3)
+    mon._tick(force=True)
+    for i in (0, 3, 9, 13):
+        assert _xrange(mon.plots[i]) == (5.0, 15.0), f"第 {i} 张图没跟上: {_xrange(mon.plots[i])}"

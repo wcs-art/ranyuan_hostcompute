@@ -23,6 +23,9 @@ AUTO_GLITCH_X = 4.0
 AUTO_PAD = 1.05
 #: 量程下限, 防止纯噪声被放大成满屏（那不是"浮动", 是没有信号）
 AUTO_MIN_SCALE = 10.0
+#: 单张图最多画的点数。缓冲能留 150 s（500 Hz 下 7.5 万点），
+#: 缩到全程时 14 张图各 7.5 万点会把 40 ms 的重绘节拍拖垮，超了就等间隔抽稀。
+MAX_DRAW = 20000
 #: 量程回差: 变化不到 ±15% 就不改档, 否则每帧跟着噪声跳
 AUTO_HYST = 1.15
 
@@ -71,6 +74,7 @@ class Monitor14(QtWidgets.QMainWindow):
         # 所以现场看到"时间一直是 0 到 10"，怀疑程序没在走。
         self._abs_clock = True
         self._x_left = 0.0            # 当前窗口左边界(秒)；累计模式下随样本数增长
+        self._zoom_src = 0            # 用户最近缩放的那张图(0~13，-1=单通道大图)
         self._n_eeg = 0               # 本次数据源累计收到的 EEG 样本数(绝对时间 = 它/fs)
         self._n_fn = 0                # fNIRS 侧计数(解耦后各走各的)
         self.ch_enable = [True]*self.n_total
@@ -181,7 +185,9 @@ class Monitor14(QtWidgets.QMainWindow):
             p.setLabel('bottom', '时间', units='s')
             self._set_left_label(p, r)
             p.setXRange(0, self.win_s, padding=0)
-            p.getViewBox().sigRangeChangedManually.connect(self._on_manual_zoom)
+            # 带上序号: 之后要按"用户缩的是哪一张"取数据并统一到 14 张图
+            p.getViewBox().sigRangeChangedManually.connect(
+                lambda *_, k=r: self._on_manual_zoom(k))
             c = p.plot(pen="y")
             # 空着的子图不能只是一片黑: 现场分不清"这条链路没送这个通道"和"程序没跑"
             tip = pg.TextItem("等待数据…", color="#909090", anchor=(0.5, 0.5))
@@ -206,7 +212,8 @@ class Monitor14(QtWidgets.QMainWindow):
         self._big.setMouseEnabled(x=True, y=True)
         self._big.setLabel('bottom', '时间', units='s')
         self._big.setXRange(0, self.win_s, padding=0)
-        self._big.getViewBox().sigRangeChangedManually.connect(self._on_manual_zoom)
+        self._big.getViewBox().sigRangeChangedManually.connect(
+            lambda *_: self._on_manual_zoom(-1))
         big_font = QtGui.QFont(); big_font.setPointSize(10)
         for ax in ('bottom', 'left'):
             self._big.getAxis(ax).setStyle(tickFont=big_font)
@@ -366,8 +373,14 @@ class Monitor14(QtWidgets.QMainWindow):
         self._follow = bool(v)
         if self._follow:
             self._reset_x_range()
-    def _on_manual_zoom(self, *_):
-        """用户拖过/滚过就停止自动改范围，否则每 40ms 被抢回，缩放等于没有。"""
+    def _on_manual_zoom(self, src=None):
+        """用户拖过/滚过就停止自动改范围，否则每 40ms 被抢回，缩放等于没有。
+
+        src 是用户缩的那张图（0~13，-1=单通道大图）。记住它，之后按它的范围取数据，
+        并把 14 张图统一到同一段，否则缩 A 图、B 图还在老位置，看着像数据对不上。
+        """
+        if isinstance(src, int):
+            self._zoom_src = src
         if self._follow:
             self._follow = False
             self.btn_follow.setChecked(False)
@@ -833,10 +846,6 @@ class Monitor14(QtWidgets.QMainWindow):
         self._st_tick += 1
         if self._st_tick % 5 == 0:
             self._refresh_status()
-        n = int(self.fs_eeg*self.win_s); m = int(self.fs_fnirs*self.win_s)
-        # 长度必须夹到缓冲宽度：不相等时绘图库抛异常，PyQt5 会直接 abort 退出
-        n = max(32, min(n, self.buf_eeg.shape[1]))
-        m = max(16, min(m, self.buf_fn.shape[1]))
         # 只画真数据：一帧都没收到，或板子已停发超过 2 s，就把曲线清空。
         # 否则缓冲区里的历史波形会一直留在屏上，看着像板子还在发。
         stale = self._t_rx is None or (time.time() - self._t_rx) > 2.0
@@ -848,42 +857,115 @@ class Monitor14(QtWidgets.QMainWindow):
             self._big_curve.setData([], [])
             self._big_tip.setText("等待数据…"); self._big_tip.show()
             return
-        # 缓冲还没填满时，前面的 0 是补位不是数据。拿它算峰峰值会把量程放大一倍
-        # （0 到 -8000 的跳变），之后信号一直被压成平线。只画已收到的样本。
-        if self._recv < n:
-            n = max(2, int(self._recv))
-        if self._recv < m:
-            m = max(2, int(self._recv))
+        # 画哪一段样本：跟随时取最近一窗；手动缩放过就按当前视图范围取。
+        # 以前固定只取 win*fs 点，缩出去只能看到"一段 10 秒的短线"，
+        # 前面几十秒明明还在缓冲里，却是一片空白（现场当成"前面的数据没了"）。
+        fe = max(self.fs_eeg, 1e-6); ff = max(self.fs_fnirs, 1e-6)
+        recv = int(self._recv)
+        ref = self._big if self._solo is not None else self.plots[
+            self._zoom_src if 0 <= self._zoom_src < self.n_total else 0]
+        if self._follow:
+            c_e = min(recv, int(self.win_s*fe)); i0_e = recv - c_e
+            c_f = min(recv, int(self.win_s*ff)); i0_f = recv - c_f
+        else:
+            v0, v1 = self._view_bounds(ref)
+            # 视图夹进"还有数据"的区间：越出去就会看到一段空白，看着像数据断了。
+            lo_ok = max(0.0, (recv - self.buf_eeg.shape[1]) / fe)
+            v0, v1 = self._clamp_to_data(v0, v1, lo_ok, recv / fe)
+            # 14 张图统一到这一段（合同 S1「时间轴统一」）：缩一张，其余跟着走，
+            # 否则别的子图还停在旧窗口，同一时刻看的是不同时间段的数据。
+            for p in self.plots + [self._big]:
+                a, b = self._view_bounds(p)
+                if abs(a - v0) > 1e-6 or abs(b - v1) > 1e-6:
+                    p.setXRange(v0, v1, padding=0)
+            i0_e = max(0, int(round(v0*fe))); c_e = max(2, int(round((v1-v0)*fe)))
+            i0_f = max(0, int(round(v0*ff))); c_f = max(2, int(round((v1-v0)*ff)))
+            # 视图可能拉到采集开始之前 / 缓冲已被覆盖，夹到实际还有的范围
+            c_e = max(0, min(c_e, recv - i0_e))
+            c_f = max(0, min(c_f, recv - i0_f))
+        xe, seg_e = self._take(self.buf_eeg, i0_e, c_e, fe, recv)
+        xf, seg_f = self._take(self.buf_fn, i0_f, c_f, ff, recv)
+        if seg_e is None or seg_f is None:
+            # 视图整段落在"还没有数据"的区间：不画线，也别留上一帧的残影
+            for c in self.curves + [self._big_curve]:
+                c.setData([], [])
+            return
         if self.eeg_scale_auto:
             # 单通道放大时只按这一路定量程：放大就是要看这一路自己的细节，
             # 拿 14 路里最大的那一路定档，小信号会被压成一条线（这正是上一版的问题）。
             if self._solo is not None and self._solo < self.n_eeg:
-                self._auto_eeg_scale(self.buf_eeg[self._solo:self._solo + 1, -n:])
+                self._auto_eeg_scale(seg_e[self._solo:self._solo + 1])
             else:
-                self._auto_eeg_scale(self.buf_eeg[:, -n:])
+                self._auto_eeg_scale(seg_e)
         # 横轴：左边界由样本序号推出（累计模式会一路涨），14 个子图共用一把尺
-        # （合同 S1「时间轴统一」）。之前固定 0~10 且缓冲正好一个窗长，现场看到的
-        # 是"时间一直是 0 到 10"，以为程序没在跑。
-        fe = max(self.fs_eeg, 1e-6); ff = max(self.fs_fnirs, 1e-6)
-        self._recalc_x_left()
-        lo = self._x_left
-        # 绝对时间：第 k 个样本对应 k/fs 秒。窗口未满时 lo=0，数据从左往右长；
-        # 满窗后 lo 跟着往后走，刻度读出来就是"采到第几秒"。
-        te = lo + np.arange(n) / fe
-        tf = lo + np.arange(m) / ff
+        # （合同 S1「时间轴统一」）。只有跟随时才改范围，否则会抢掉用户的缩放。
         if self._follow:
+            self._recalc_x_left()
             self._reset_x_range()
         # 网格页的 14 张图
         for i in range(self.n_total):
-            x, cnt = (te, n) if i < self.n_eeg else (tf, m)
-            self._paint(self.plots[i], self.curves[i], self._tips[i], i, x, cnt)
+            if i < self.n_eeg:
+                self._paint(self.plots[i], self.curves[i], self._tips[i], i, xe, seg_e[i])
+            else:
+                self._paint(self.plots[i], self.curves[i], self._tips[i], i, xf,
+                            seg_f[i - self.n_eeg])
         # 大图页：同一份数据再画一次，量程只按这一路算
         if self._solo is not None:
             i = self._solo
-            x, cnt = (te, n) if i < self.n_eeg else (tf, m)
-            self._paint(self._big, self._big_curve, self._big_tip, i, x, cnt)
+            if i < self.n_eeg:
+                self._paint(self._big, self._big_curve, self._big_tip, i, xe, seg_e[i])
+            else:
+                self._paint(self._big, self._big_curve, self._big_tip, i, xf,
+                            seg_f[i - self.n_eeg])
 
-    def _paint(self, plot, curve, tip, i: int, x, cnt: int):
+    def _view_bounds(self, plot):
+        """当前视图的横轴范围(秒)，取不到就给窗口默认值。"""
+        try:
+            lo, hi = plot.getViewBox().viewRange()[0]
+            return float(lo), float(hi)
+        except Exception:  # noqa: BLE001
+            return 0.0, self.win_s
+
+    @staticmethod
+    def _clamp_to_data(v0: float, v1: float, lo_ok: float, hi_ok: float):
+        """把视图夹进 [lo_ok, hi_ok]（还有数据的区间）。
+
+        不夹的话，缩出去/拖出去就会在曲线两端留下空白 —— 现场看到的是
+        "时间轴 210~255，曲线只有 240~250 一段"，会以为前面的数据丢了。
+        宽度本身比可用区间还大时也压到可用区间，保证整轴都有数据。
+        """
+        span = v1 - v0
+        if not (span > 0) or not (hi_ok > lo_ok):
+            return v0, v1
+        span = min(span, hi_ok - lo_ok)
+        if v1 > hi_ok:
+            v0, v1 = hi_ok - span, hi_ok
+        if v0 < lo_ok:
+            v0, v1 = lo_ok, lo_ok + span
+        return v0, v1
+
+    def _take(self, buf, i0: int, cnt: int, fs: float, recv: int):
+        """从环形缓冲取绝对样本区间 [i0, i0+cnt)，返回 (x 秒, 二维切片)。
+
+        缓冲里只有最近 B 个样本（B/fs 秒），更早的已经被覆盖；要的那段如果
+        整段落在外面就返回 (None, None)，让调用方清屏而不是画错位的数据。
+        点数超过 MAX_DRAW 就等间隔抽稀：缩到 150 s 时 14 张图各 7.5 万点会明显卡。
+        """
+        if cnt < 2:
+            return None, None
+        B = buf.shape[1]
+        off = recv - B                       # 缓冲第 0 列对应的绝对样本序号
+        c0 = max(0, i0 - off); c1 = min(B, i0 + cnt - off)
+        if c1 - c0 < 2:
+            return None, None
+        x = (off + np.arange(c0, c1)) / fs
+        seg = buf[:, c0:c1]
+        if seg.shape[1] > MAX_DRAW:
+            step = int(np.ceil(seg.shape[1] / MAX_DRAW))
+            x = x[::step]; seg = seg[:, ::step]
+        return x, seg
+
+    def _paint(self, plot, curve, tip, i: int, x, y):
         """把第 i 路画到指定的图上；14 图小图与单通道大图共用这一份逻辑。
 
         两条规则不变：
@@ -899,14 +981,13 @@ class Monitor14(QtWidgets.QMainWindow):
                 plot.setYRange(-1.0, 1.0, padding=0)
                 return
             tip.hide()
-            seg = self.buf_eeg[i, -cnt:]
-            curve.setData(x, seg)
+            curve.setData(x, y)
             if not self._follow:
                 return                     # 手动缩放中: 不再抢用户的视野
-            if self.eeg_scale_auto and seg.size:
+            if self.eeg_scale_auto and y.size:
                 # 自动档: 窗口跟着信号中心走, 带直流偏置的原始值也能看清细节
-                rs = self._robust_span(seg)
-                mid = rs[0] if rs is not None else float(np.median(seg))
+                rs = self._robust_span(y)
+                mid = rs[0] if rs is not None else float(np.median(y))
                 if np.isfinite(mid):
                     # padding=0: pyqtgraph 默认再给 2% 边距，叠上自己的余量就更扁了
                     plot.setYRange(mid - self.eeg_scale, mid + self.eeg_scale, padding=0)
@@ -916,14 +997,13 @@ class Monitor14(QtWidgets.QMainWindow):
                 # 手动档: 保持 ±量程 的绝对语义, 不跟随信号漂移
                 plot.setYRange(-self.eeg_scale, self.eeg_scale, padding=0)
             return
-        j = i - self.n_eeg
         if not (self.ch_enable[i] and self._ch_ok[i]):
             curve.setData([], [])
             tip.setText("无数据（本链路未发送该通道）"); tip.show()
             plot.setYRange(-0.01, 0.01, padding=0)
             return
         tip.hide()
-        curve.setData(x, self.buf_fn[j, -cnt:])
+        curve.setData(x, y)
         if self._follow:
             plot.setYRange(-self.fnirs_scale, self.fnirs_scale, padding=0)
 
