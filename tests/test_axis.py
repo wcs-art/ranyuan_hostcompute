@@ -53,10 +53,18 @@ def test_window_switch_moves_axis(mon):
 
 
 def test_axis_labels_carry_units(mon):
-    """横轴标秒；纵轴标单位。没有单位的刻度不叫"幅度标尺"。"""
+    """横轴标秒；纵轴标单位。没有单位的刻度不叫"幅度标尺"。
+
+    网格图的纵轴标题用短版（EEG / ΔHbO2·ΔHbR）——格子只有二三十像素高，
+    长标题会被裁成半截字；完整单位在单通道放大页。
+    """
     assert mon.plots[0].getAxis("bottom").labelUnits == "s"
-    assert mon.plots[0].getAxis("left").labelUnits == "μV"
-    assert mon.plots[4].getAxis("left").labelUnits == "mM"
+    assert mon.plots[0].getAxis("left").labelText == "EEG"
+    assert mon.plots[4].getAxis("left").labelText == "ΔHbO2·ΔHbR"
+    mon._solo_plot(0)
+    assert mon._big.getAxis("left").labelUnits == "μV"
+    mon._solo_plot(4)
+    assert mon._big.getAxis("left").labelUnits == "mM"
 
 
 def test_text_source_marks_unknown_unit(mon, tmp_path):
@@ -68,7 +76,10 @@ def test_text_source_marks_unknown_unit(mon, tmp_path):
     src = TextFileSource(p)
     mon.attach_receiver(src)
     assert "原始值" in mon.eeg_unit
-    assert mon.plots[0].getAxis("left").labelUnits == mon.eeg_unit
+    # 网格用短标题，完整单位看放大页
+    assert mon.plots[0].getAxis("left").labelText == "EEG"
+    mon._solo_plot(0)
+    assert mon._big.getAxis("left").labelUnits == mon.eeg_unit
 
 
 def test_manual_zoom_stops_auto_follow(mon):
@@ -395,20 +406,24 @@ def test_zoom_is_shared_by_all_plots(mon):
 
 
 # ---- 放大缩小不许改数值本身 ---------------------------------------------------
-def test_grid_axis_hides_numbers_and_big_shows_raw(mon):
-    """14 图太小放不下六位刻度（-104300），会叠成黑糊，现场看着像"纵轴坏了"。
+def test_grid_shows_y_range_as_labels_and_big_shows_raw(mon):
+    """网格图要能读到纵轴数值（贴在图内左上角两行），放大页写完整刻度。
 
-    所以：网格页不画刻度数字（保留刻度线与单位标签），单通道放大页写原始数字。
-    两张图用的是同一份数据，数值必须完全一致（都不得被 SI 前缀缩成 -104.3）。
+    坐标轴画不了：14 图并排时轴只有三十几像素宽，六位数字整段被裁掉（实测看不见）。
+    所以网格用两个 QLabel 写上下限；放大页仍由轴画，且不得被 SI 前缀缩成 -104.3。
     """
-    for p in mon.plots:
-        assert p.getAxis('left').style['showValues'] is False, "14 图还在画挤不下的六位刻度"
-        assert p.getAxis('left').autoSIPrefix is False
+    _push(mon, [-104300.0 + (i % 7) for i in range(600)])
+    hi = mon._ylbl_hi[0].text()
+    lo = mon._ylbl_lo[0].text()
+    assert hi and lo, "网格图纵轴没有读数"
+    assert "." not in hi and "." not in lo, f"坐标被缩放了: {hi} / {lo}"
+    assert len(hi) >= 5 and int(hi) > int(lo), f"上下限不对: {hi} / {lo}"
+    assert mon._ylbl_hi[1].isHidden(), "没有数据的通道不该显示纵轴读数"
     mon._solo_plot(0)
-    ax = mon._big.getAxis('left')
-    assert ax.style['showValues'] is True, "放大页必须能读到数值"
-    assert ax.autoSIPrefix is False
-    assert ax.tickStrings([-104300.0], 1.0, 1) == ['-104300']
+    axb = mon._big.getAxis("left")
+    assert axb.style["showValues"] is True
+    assert axb.autoSIPrefix is False
+    assert axb.tickStrings([-104300.0], 1.0, 1) == ["-104300"]
 
 
 def test_zoom_does_not_change_the_numbers(mon, app):
@@ -479,3 +494,20 @@ def test_zoom_keeps_data_inside_y_window_in_solo(mon, app):
         assert len(y) > 0, f"缩到 {lo}~{hi}s 后没有数据"
         assert float(min(y)) > yv[0] and float(max(y)) < yv[1], \
             f"缩到 {lo}~{hi}s 后曲线跑出窗口: 数据 {min(y):.0f}~{max(y):.0f}, 视野 {yv[0]:.0f}~{yv[1]:.0f}"
+
+
+def test_max_zoom_keeps_a_visible_window(mon):
+    """"放到最大"不许缩到只剩一两个点：至少留 MIN_SPAN_S（0.2 s）。
+
+    现场症状：滚到最里面，屏幕空白（只剩 1~2 个采样，_take 取不到或画成一个点）。
+    """
+    import monitor_14ch
+    mon.fs_eeg = mon.fs_fnirs = 334.0
+    _push(mon, [-104300.0 + (i % 7) for i in range(3000)])
+    mon.plots[0].setXRange(8.899, 8.9, padding=0)
+    mon._on_manual_zoom(0)
+    mon._tick(force=True)
+    lo, hi = _xrange(mon.plots[0])
+    assert hi - lo >= monitor_14ch.MIN_SPAN_S - 1e-6, f"放到最大只剩 {hi - lo:.4f}s"
+    n = len(mon.curves[0].getData()[0])
+    assert n >= 50, f"放到最大只剩 {n} 个点，屏幕上等于没有"

@@ -26,6 +26,9 @@ AUTO_MIN_SCALE = 10.0
 #: 单张图最多画的点数。缓冲能留 150 s（500 Hz 下 7.5 万点），
 #: 缩到全程时 14 张图各 7.5 万点会把 40 ms 的重绘节拍拖垮，超了就等间隔抽稀。
 MAX_DRAW = 20000
+#: 时间轴最小可视宽度（秒）。滚轮/双击"放到最大"时不许再窄下去：
+#: 窄到一个采样点以内就只剩 1~2 个点，屏幕上看不出波形（现场当成"数据没了"）。
+MIN_SPAN_S = 0.2
 #: 量程回差: 变化不到 ±15% 就不改档, 否则每帧跟着噪声跳
 AUTO_HYST = 1.15
 
@@ -159,6 +162,9 @@ class Monitor14(QtWidgets.QMainWindow):
         self.ch_scroll = scroll  # S1: 主界面嵌入时隐藏内嵌通道条, 只留外部通道开关
         self.plots = []; self.curves = []
         self._tips = []          # 空子图上的灰字提示(等待数据/本链路未发送该通道)
+        self._ytick_cache = {}   # 网格小图"上下限两个读数"的上次文本，避免每帧重画
+        self._ylbl_hi = []       # 网格图里"纵轴上限"的读数
+        self._ylbl_lo = []       # 网格图里"纵轴下限"的读数
         names = ch_labels
         ncols = 2 if self.n_total <= 16 else 4
         self._names = names; self._ncols = ncols
@@ -186,11 +192,12 @@ class Monitor14(QtWidgets.QMainWindow):
             p.setMouseEnabled(x=True, y=False)
             # 合同 S1 要求「时间轴统一」: 横轴必须是同一个绝对量(秒), 不能各图各的
             p.setLabel('bottom', '时间', units='s')
-            self._set_left_label(p, r)
-            # 14 图并排时每张的可绘区只有二三十像素高，六位刻度（-104300）根本放不下，
-            # 会叠成一团黑糊，现场反而以为"纵轴坏了、数值变了"。
-            # 这里只保留刻度线和网格，数值到「单通道放大」里看，那里空间够、写的是原值。
-            p.getAxis('left').setStyle(showValues=False)
+            self._set_left_label(p, r, short=True)
+            # 纵轴要能读到数，但 14 图只有二三十像素高：六位刻度交给坐标轴画，
+            # pyqtgraph 会把超宽的文字整段裁掉（实测轴宽 35px、字宽 30px 就一个都看不见）。
+            # 所以网格里用两个小标签直接贴在绘图区左上/左下写上下限，见 _mark_grid_ticks。
+            ax_l = p.getAxis('left')
+            ax_l.setStyle(showValues=False)
             p.setXRange(0, self.win_s, padding=0)
             # 带上序号: 之后要按"用户缩的是哪一张"取数据并统一到 14 张图
             p.getViewBox().sigRangeChangedManually.connect(
@@ -200,6 +207,16 @@ class Monitor14(QtWidgets.QMainWindow):
             tip = pg.TextItem("等待数据…", color="#909090", anchor=(0.5, 0.5))
             tip.setPos(self.win_s / 2.0, 0.0); tip.hide()
             p.addItem(tip); self._tips.append(tip)
+            # 纵轴上下限读数：用 QLabel 贴在小图里。
+            # 坐标轴画不了（轴宽 35px、六位字要 45px，会被整段裁掉）；TextItem 也放不下
+            # （格子只有三十几像素高，文字锚点贴边就被裁）。QLabel 叠在绘图区上方，稳定可见。
+            for top in (True, False):
+                lb = QtWidgets.QLabel("", p)
+                lb.setFixedSize(58, 13)
+                lb.setStyleSheet("color:#c8c8c8; font-size:7pt; background:rgba(0,0,0,110);")
+                lb.setAttribute(QtCore.Qt.WA_TransparentForMouseEvents, True)
+                lb.hide(); lb.raise_()
+                (self._ylbl_hi if top else self._ylbl_lo).append(lb)
             # 14 图并排时每张只有几十像素高，起伏看不出来。双击任何一张 -> 单独放大
             p.scene().sigMouseClicked.connect(lambda ev, k=r: self._on_plot_click(ev, k))
             gl.addWidget(p, r // ncols, r % ncols); self.plots.append(p); self.curves.append(c)
@@ -269,12 +286,22 @@ class Monitor14(QtWidgets.QMainWindow):
     def _title_of(self, i: int) -> str:
         return self._names[i] if i < len(self._names) else f"CH{i+1}"
 
-    def _set_left_label(self, plot, i: int):
-        """纵轴单位跟着通道与链路走：fNIRS 是 mM，文本链路的 EEG 是"单位待定"。"""
+    def _set_left_label(self, plot, i: int, short: bool = False):
+        """纵轴单位跟着通道与链路走：fNIRS 是 mM，文本链路的 EEG 是"单位待定"。
+
+        short=True 给 14 图网格用：格子只有二三十像素高，长的旋转标题会被裁成
+        "单位."这种半截字，刻度数字也没地方放。网格里只写通道类型，完整单位在放大页看。
+        """
         if i < self.n_eeg:
-            plot.setLabel('left', 'EEG', units=self.eeg_unit)
+            if short:
+                plot.setLabel('left', 'EEG')
+            else:
+                plot.setLabel('left', 'EEG', units=self.eeg_unit)
         else:
-            plot.setLabel('left', 'ΔHbO2/ΔHbR', units=self.fnirs_unit)
+            if short:
+                plot.setLabel('left', 'ΔHbO2·ΔHbR')
+            else:
+                plot.setLabel('left', 'ΔHbO2/ΔHbR', units=self.fnirs_unit)
         self._no_si_prefix(plot)
 
     @staticmethod
@@ -396,9 +423,12 @@ class Monitor14(QtWidgets.QMainWindow):
             self.btn_follow.setChecked(False)
             self.lbl.setText("已手动缩放：不再自动跟随，点「跟随最新」恢复")
     def _apply_axis_labels(self):
-        """单位随链路变：二进制是折算后的 μV，文本是未换算的原始值。"""
+        """单位随链路变：二进制是折算后的 μV，文本是未换算的原始值。
+
+        网格用短标题（格子太矮，长标题会被裁成半截），放大页用完整单位。
+        """
         for i, p in enumerate(self.plots):
-            self._set_left_label(p, i)
+            self._set_left_label(p, i, short=True)
         if self._solo is not None:
             self._set_left_label(self._big, self._solo)
     @staticmethod
@@ -881,7 +911,10 @@ class Monitor14(QtWidgets.QMainWindow):
             v0, v1 = self._view_bounds(ref)
             # 视图夹进"还有数据"的区间：越出去就会看到一段空白，看着像数据断了。
             lo_ok = max(0.0, (recv - self.buf_eeg.shape[1]) / fe)
-            v0, v1 = self._clamp_to_data(v0, v1, lo_ok, recv / fe)
+            # min_span: 放最大时至少留 MIN_SPAN_S（0.2 s）。再窄就只剩一两个采样点，
+            # _take 取不到东西会清屏，或者画出一个点 —— 现场就是"放到最大数据没了"。
+            v0, v1 = self._clamp_to_data(v0, v1, lo_ok, recv / fe,
+                                        max(MIN_SPAN_S, 2.0 / fe))
             # 14 张图统一到这一段（合同 S1「时间轴统一」）：缩一张，其余跟着走，
             # 否则别的子图还停在旧窗口，同一时刻看的是不同时间段的数据。
             for p in self.plots + [self._big]:
@@ -893,6 +926,11 @@ class Monitor14(QtWidgets.QMainWindow):
             # 视图可能拉到采集开始之前 / 缓冲已被覆盖，夹到实际还有的范围
             c_e = max(0, min(c_e, recv - i0_e))
             c_f = max(0, min(c_f, recv - i0_f))
+            # 窗口贴着最新点又极窄时可能只剩 1 个点，退两个样本出来，保证画得出来
+            if c_e < 2 and recv >= 2:
+                i0_e, c_e = recv - 2, 2
+            if c_f < 2 and recv >= 2:
+                i0_f, c_f = recv - 2, 2
         xe, seg_e = self._take(self.buf_eeg, i0_e, c_e, fe, recv)
         xf, seg_f = self._take(self.buf_fn, i0_f, c_f, ff, recv)
         if seg_e is None or seg_f is None:
@@ -937,21 +975,30 @@ class Monitor14(QtWidgets.QMainWindow):
             return 0.0, self.win_s
 
     @staticmethod
-    def _clamp_to_data(v0: float, v1: float, lo_ok: float, hi_ok: float):
+    def _clamp_to_data(v0: float, v1: float, lo_ok: float, hi_ok: float,
+                       min_span: float = 0.0):
         """把视图夹进 [lo_ok, hi_ok]（还有数据的区间）。
 
         不夹的话，缩出去/拖出去就会在曲线两端留下空白 —— 现场看到的是
         "时间轴 210~255，曲线只有 240~250 一段"，会以为前面的数据丢了。
         宽度本身比可用区间还大时也压到可用区间，保证整轴都有数据。
+        min_span: 最小宽度（放最大时至少留 2 个采样），太窄会连一个点都取不到。
         """
         span = v1 - v0
         if not (span > 0) or not (hi_ok > lo_ok):
             return v0, v1
         span = min(span, hi_ok - lo_ok)
-        if v1 > hi_ok:
-            v0, v1 = hi_ok - span, hi_ok
+        span = max(span, min(min_span, hi_ok - lo_ok))
+        # 宽度定下来之后，用右边界做锚点整体平移进区间。
+        # （旧写法只在"越界"分支里改 v0/v1，宽度被 min_span 撑大时改不动，
+        #   于是"放到最大"仍然只剩 0.005 s、屏幕上只有两个点。）
+        v0 = v1 - span
         if v0 < lo_ok:
-            v0, v1 = lo_ok, lo_ok + span
+            v0 = lo_ok
+        v1 = v0 + span
+        if v1 > hi_ok:
+            v1 = hi_ok
+            v0 = v1 - span
         return v0, v1
 
     def _take(self, buf, i0: int, cnt: int, fs: float, recv: int):
@@ -989,6 +1036,7 @@ class Monitor14(QtWidgets.QMainWindow):
                 curve.setData([], [])
                 tip.setText("无数据（本链路未发送该通道）"); tip.show()
                 plot.setYRange(-1.0, 1.0, padding=0)
+                self._hide_ylabels(i)
                 return
             tip.hide()
             curve.setData(x, y)
@@ -1001,10 +1049,17 @@ class Monitor14(QtWidgets.QMainWindow):
             curve.setData([], [])
             tip.setText("无数据（本链路未发送该通道）"); tip.show()
             plot.setYRange(-0.01, 0.01, padding=0)
+            self._hide_ylabels(i)
             return
         tip.hide()
         curve.setData(x, y)
         self._fit_y(plot, i, y)
+
+    def _hide_ylabels(self, i: int):
+        """没有数据的通道不显示纵轴读数，否则旧数字会留在空图上。"""
+        for arr in (self._ylbl_hi, self._ylbl_lo):
+            if 0 <= i < len(arr):
+                arr[i].hide()
 
     def _fit_y(self, plot, i: int, y):
         """按这一路可见数据的鲁棒中心/半幅设 Y 范围（与横轴是否手动缩放无关）。"""
@@ -1022,6 +1077,44 @@ class Monitor14(QtWidgets.QMainWindow):
                 plot.setYRange(-self.eeg_scale, self.eeg_scale, padding=0)
         else:
             plot.setYRange(-self.fnirs_scale, self.fnirs_scale, padding=0)
+        self._mark_grid_ticks(plot)
+
+    def _mark_grid_ticks(self, plot):
+        """网格小图在图内左上/左下写出纵轴上下限（六位原值，7pt）。
+
+        为什么不交给坐标轴：14 图并排时轴只有三十几像素宽，六位数字会被整段裁掉
+        —— 实测轴宽 35px、字宽 45px 时一个数字都看不见，现场就说"放大以前纵坐标没有数据"。
+        用 QLabel 叠在绘图区上方：不受轴宽限制，也不挤占曲线；放大页仍是完整刻度。
+        """
+        if plot is getattr(self, "_big", None):
+            return
+        try:
+            i = self.plots.index(plot)
+        except ValueError:
+            return
+        if i >= len(self._ylbl_hi):
+            return
+        try:
+            lo, hi = plot.getViewBox().viewRange()[1]
+            lo = float(lo); hi = float(hi)
+            if not (hi > lo):
+                return
+            big = max(abs(lo), abs(hi))
+            fmt = "{:.0f}" if big >= 10 else "{:.3f}"
+            key = (fmt.format(lo), fmt.format(hi))
+            if self._ytick_cache.get(id(plot)) != key:
+                self._ytick_cache[id(plot)] = key
+                self._ylbl_hi[i].setText(key[1])
+                self._ylbl_lo[i].setText(key[0])
+            axw = int(plot.getAxis('left').width()) + 3
+            # 两行读数都放在左上角（第一行=上限、第二行=下限）：
+            # 放到图底会被 x 轴刻度区盖住，放到图内底部又会压住曲线。
+            self._ylbl_hi[i].move(axw, 1)
+            self._ylbl_lo[i].move(axw, 15)
+            self._ylbl_hi[i].show(); self._ylbl_lo[i].show()
+            self._ylbl_hi[i].raise_(); self._ylbl_lo[i].raise_()
+        except Exception:  # noqa: BLE001
+            return
 
 
 def main():
