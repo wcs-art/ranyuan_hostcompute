@@ -64,6 +64,15 @@ class Monitor14(QtWidgets.QMainWindow):
         # 自动改范围(时间轴滚动+量程)的开关。用户一旦手动缩放就关掉,
         # 否则每 40ms 被 setXRange/setYRange 抢回去, "支持缩放"等于没有。
         self._follow = True
+        # 时间轴两种画法:
+        #   累计(默认) —— 横轴从 0 起一路加: 0~10、12~22、…，刻度能读出"采了多久"；
+        #   固定窗口  —— 永远是 0~win，只是波形往左滚，刻度恒定不动。
+        # 之前只有固定窗口: 缓冲区正好一个窗长，每帧挤掉最早一帧再从 0 重排，
+        # 所以现场看到"时间一直是 0 到 10"，怀疑程序没在走。
+        self._abs_clock = True
+        self._x_left = 0.0            # 当前窗口左边界(秒)；累计模式下随样本数增长
+        self._n_eeg = 0               # 本次数据源累计收到的 EEG 样本数(绝对时间 = 它/fs)
+        self._n_fn = 0                # fNIRS 侧计数(解耦后各走各的)
         self.ch_enable = [True]*self.n_total
         # 每个通道是否真的收到过数据。文本链路只有 1 列时, 其余通道是补 0 的,
         # 若照画就会得到一条贴 0 的假平线, 现场会当成"信号一直是 0"。
@@ -102,6 +111,13 @@ class Monitor14(QtWidgets.QMainWindow):
         self.btn_solo = QtWidgets.QPushButton("⤢ 单通道放大")
         self.btn_solo.setToolTip("放大当前点中的子图（也可直接双击子图，Esc 还原）")
         self.btn_solo.clicked.connect(self._toggle_solo)
+        # 时间轴模式：默认累计（刻度会涨），可切回固定窗口对照合同里的 0~win
+        self.btn_clock = QtWidgets.QPushButton("时间轴: 累计")
+        self.btn_clock.setCheckable(True); self.btn_clock.setChecked(True)
+        self.btn_clock.setToolTip(
+            "勾选：横轴累加（0~10、12~22…），能看出已经采了多久；\n"
+            "取消：固定 0~时间窗，刻度恒为 0~10，只有波形滚动")
+        self.btn_clock.toggled.connect(self._set_clock)
         self.lbl = QtWidgets.QLabel("丢包率 0.0% | 电量 --% | seq连续 OK")
         # S3: 各通道信号质量的实时显示(此前只在内存里算, 从没画到界面上)
         self.lbl_quality = QtWidgets.QLabel("通道质量 --")
@@ -109,7 +125,8 @@ class Monitor14(QtWidgets.QMainWindow):
         self.btn_verify = QtWidgets.QPushButton("离线自检")
         self.btn_verify.clicked.connect(self._open_verify)
         for w in (self.btn_pause, self.cmb_fnirs, self.cmb_win, self.cmb_scale,
-                  self.cmb_fscale, self.btn_follow, self.btn_solo, self.btn_verify, self.lbl):
+                  self.cmb_fscale, self.btn_follow, self.btn_clock, self.btn_solo,
+                  self.btn_verify, self.lbl):
             bar.addWidget(w)
         lay.addLayout(bar)
         qrow = QtWidgets.QHBoxLayout()
@@ -193,6 +210,7 @@ class Monitor14(QtWidgets.QMainWindow):
         big_font = QtGui.QFont(); big_font.setPointSize(10)
         for ax in ('bottom', 'left'):
             self._big.getAxis(ax).setStyle(tickFont=big_font)
+        self._no_si_prefix(self._big)
         self._big_curve = self._big.plot(pen="y")
         self._big_tip = pg.TextItem("等待数据…", color="#909090", anchor=(0.5, 0.5))
         self._big_tip.setPos(self.win_s / 2.0, 0.0); self._big_tip.hide()
@@ -240,6 +258,22 @@ class Monitor14(QtWidgets.QMainWindow):
             plot.setLabel('left', 'EEG', units=self.eeg_unit)
         else:
             plot.setLabel('left', 'ΔHbO2/ΔHbR', units=self.fnirs_unit)
+        self._no_si_prefix(plot)
+
+    @staticmethod
+    def _no_si_prefix(plot):
+        """关掉 pyqtgraph 的 SI 前缀缩写，刻度上写多少就是多少。
+
+        默认 autoSIPrefix=True 时，纵轴 -120300 会被画成 "-120"（内部乘以 0.001），
+        而"(x1000)"这个乘数只在 labelUnits 为空时才拼进轴标签；我们给轴设了
+        "原始值·单位待定"，于是乘数被静默丢掉 —— 现场看到的 -120 与终端里的
+        -120362.52 差 1000 倍，直接判成"数据不对"。宁可刻度长一点，也不能改写数值。
+        """
+        for name in ('left', 'bottom'):
+            try:
+                plot.getAxis(name).enableAutoSIPrefix(False)
+            except Exception:  # noqa: BLE001
+                pass
 
     def _on_plot_click(self, ev, i: int):
         """点一下记住"当前是哪一路"，双击则放大/还原。"""
@@ -293,16 +327,41 @@ class Monitor14(QtWidgets.QMainWindow):
     def _set_win(self, i: int):
         """时间窗切换后立刻重设横轴，不然要等下一次重绘才对齐。"""
         self.win_s = (5.0, 10.0, 30.0)[i]
+        self._recalc_x_left()
         self._reset_x_range()
+        self._tick(force=True)
+    def _set_clock(self, v: bool):
+        """切换「累计时间 / 固定窗口」。切换后立刻重画，避免要等下一帧才对齐。"""
+        self._abs_clock = bool(v)
+        self.btn_clock.setText("时间轴: 累计" if self._abs_clock else "时间轴: 固定窗口")
+        self._recalc_x_left()
+        self._reset_x_range()
+        self._tick(force=True)
+    def _recalc_x_left(self):
+        """算出当前窗口左边界(秒)。累计模式下 = 已收到的时长 − 窗长；固定窗口恒为 0。
+
+        为什么不取 time.time()-t0 而当"样本数 / 采样率"：文件回放会把 10 s 数据
+        在 0.1 s 内灌完，用挂钟会把横轴算成 0.1 s，整段波形挤在左边缘。样本序号
+        在实机与回放里都等于"第几个采样点"，两种链路都自洽。
+        """
+        if not self._abs_clock:
+            self._x_left = 0.0
+            return
+        fe = max(self.fs_eeg, 1e-6)
+        self._x_left = max(0.0, self._n_eeg / fe - self.win_s)
     def _reset_x_range(self):
-        """所有图（含大图）统一横轴：0 ~ win_s 秒，0 = 窗口最左，右端 = 最新数据。"""
+        """所有图（含大图）统一横轴：左边界 ~ 左边界+窗长，右端是最新一帧。
+
+        「统一」是合同 S1 的硬要求：14 张图必须是同一把尺，不能各画各的。
+        """
+        lo = float(self._x_left); hi = lo + self.win_s
         for i, p in enumerate(self.plots):
-            p.setXRange(0, self.win_s, padding=0)
+            p.setXRange(lo, hi, padding=0)
             if i < len(self._tips):
-                self._tips[i].setPos(self.win_s / 2.0, 0.0)
+                self._tips[i].setPos((lo + hi) / 2.0, 0.0)
         if hasattr(self, "_big"):
-            self._big.setXRange(0, self.win_s, padding=0)
-            self._big_tip.setPos(self.win_s / 2.0, 0.0)
+            self._big.setXRange(lo, hi, padding=0)
+            self._big_tip.setPos((lo + hi) / 2.0, 0.0)
     def _set_follow(self, v: bool):
         self._follow = bool(v)
         if self._follow:
@@ -574,6 +633,9 @@ class Monitor14(QtWidgets.QMainWindow):
             else:
                 self._seq_resets = getattr(self, "_seq_resets", 0) + 1  # 回落=复位/大乱序
         self._seq_last = seq; self._recv += 1
+        # 样本计数只增不减(缓冲区是滚动的)，横轴的绝对秒数由它推出
+        self._n_eeg += 1
+        self._n_fn += 1
         if battery >= 0: self.battery_pct = float(battery)
         self.buf_eeg = np.roll(self.buf_eeg, -1, axis=1); self.buf_eeg[:, -1] = eeg_uv
         # 有真实光强就用真实值算 ΔHbO/ΔHbR; 算不出来(基线未建完/坏道)沿用入参(通常为 0)
@@ -692,6 +754,9 @@ class Monitor14(QtWidgets.QMainWindow):
         self._seq_last = -1
         self._lost = 0
         self._recv = 0
+        self._n_eeg = 0               # 换源后绝对时间从 0 重新算
+        self._n_fn = 0
+        self._x_left = 0.0
         self._sim_seq = 0
         self.fs_measured = 0.0
         self._fs_snapped = False      # 换源后重新按实测帧率校准
@@ -796,11 +861,16 @@ class Monitor14(QtWidgets.QMainWindow):
                 self._auto_eeg_scale(self.buf_eeg[self._solo:self._solo + 1, -n:])
             else:
                 self._auto_eeg_scale(self.buf_eeg[:, -n:])
-        # 横轴从 0 向右递增：最左是窗口里最早的一帧，最右是最新一帧，14 个子图共用一把尺
-        # （合同 S1「时间轴统一」）。之前用负值表示"距今多少秒"，读数要反着看，现场容易误判。
+        # 横轴：左边界由样本序号推出（累计模式会一路涨），14 个子图共用一把尺
+        # （合同 S1「时间轴统一」）。之前固定 0~10 且缓冲正好一个窗长，现场看到的
+        # 是"时间一直是 0 到 10"，以为程序没在跑。
         fe = max(self.fs_eeg, 1e-6); ff = max(self.fs_fnirs, 1e-6)
-        te = np.arange(n) / fe
-        tf = np.arange(m) / ff
+        self._recalc_x_left()
+        lo = self._x_left
+        # 绝对时间：第 k 个样本对应 k/fs 秒。窗口未满时 lo=0，数据从左往右长；
+        # 满窗后 lo 跟着往后走，刻度读出来就是"采到第几秒"。
+        te = lo + np.arange(n) / fe
+        tf = lo + np.arange(m) / ff
         if self._follow:
             self._reset_x_range()
         # 网格页的 14 张图

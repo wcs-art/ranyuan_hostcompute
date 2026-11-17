@@ -293,3 +293,46 @@ def test_auto_scale_fills_the_height(mon):
     lo, hi = mon.plots[0].getViewBox().viewRange()[1]
     assert hi > lo
     assert 90.0 / (hi - lo) > 0.85, f"峰峰 90 只占 {90.0 / (hi - lo):.0%} 屏高"
+
+
+# ---- 刻度必须写真值 / 时间轴要能读出"采了多久" ------------------------------
+def test_y_ticks_are_not_si_shrunk(mon):
+    """-120300 不许被画成 -120。
+
+    现场终端里是 -120362.52，界面纵轴却是 -120，差 1000 倍。原因是 pyqtgraph 的
+    autoSIPrefix 把刻度除以 1000，而"(x1000)"这个乘数只有在轴不带单位文字时才
+    拼进标签（AxisItem.labelString）；我们给了"原始值·单位待定"，乘数被静默丢掉。
+    """
+    for p in mon.plots + [mon._big]:
+        ax = p.getAxis('left')
+        assert ax.autoSIPrefix is False, "纵轴还开着 SI 前缀缩写"
+        assert ax.autoSIPrefixScale == 1.0
+    assert mon.plots[0].getAxis('left').tickStrings([-120300.0], 1.0, 1) == ['-120300']
+
+
+def test_plotted_value_equals_received_value(mon):
+    """画到曲线上的数必须就是收到的数，不许做任何缩放。"""
+    vals = [-120362.52, -120373.43, -120243.03]
+    _push(mon, vals)
+    y = [round(float(v), 2) for v in list(mon.curves[0].getData()[1])[-3:]]
+    assert y == vals, f"曲线值与接收值不符: {y} != {vals}"
+
+
+def test_clock_axis_keeps_accumulating(mon):
+    """时间轴要能读出"已经采了多久"：30 s 数据时横轴应为 20~30，而不是恒为 0~10。"""
+    mon.fs_eeg = mon.fs_fnirs = 100.0        # 降采样，30 s 只要 3000 帧
+    _push(mon, [-120300.0] * 1200)           # 12 s -> 窗口 2~12
+    assert _xrange(mon.plots[0]) == (2.0, 12.0)
+    _push(mon, [-120300.0] * 1800)           # 30 s -> 窗口 20~30
+    assert _xrange(mon.plots[0]) == (20.0, 30.0)
+    assert all(_xrange(p) == (20.0, 30.0) for p in mon.plots), "14 张图时间轴必须一致"
+
+
+def test_fixed_window_mode_keeps_zero(mon):
+    """切回「固定窗口」时横轴恒为 0~10，方便按合同逐格读数。"""
+    mon.fs_eeg = mon.fs_fnirs = 100.0
+    _push(mon, [-120300.0] * 2000)
+    assert _xrange(mon.plots[0]) == (10.0, 20.0)
+    mon.btn_clock.setChecked(False)
+    assert _xrange(mon.plots[0]) == (0.0, 10.0)
+    assert "固定窗口" in mon.btn_clock.text()
