@@ -206,3 +206,56 @@ def test_waiting_hint_before_any_frame(mon):
     for _ in range(3):
         mon._tick()
     assert all("等待数据" in t.toPlainText() for t in mon._tips)
+
+
+# ---- 单通道放大 / 纵轴贴合 ---------------------------------------------------
+def _vb_height(mon, i=0):
+    return mon.plots[i].getViewBox().sceneBoundingRect().height()
+
+
+def test_solo_plot_fills_the_grid(mon, app):
+    """14 图并排时每张只有几像素高，双击放大后必须真正占满整块。"""
+    mon.resize(1200, 760); mon.show()
+    _push(mon, [-112666.0 + (i % 7) for i in range(600)])
+    for _ in range(2):
+        mon._tick(); app.processEvents()
+    h14 = _vb_height(mon)
+    mon._solo_plot(0)
+    for _ in range(2):
+        mon._tick(); app.processEvents()
+    assert sum(p.isVisible() for p in mon.plots) == 1, "放大后其它通道还在抢版面"
+    assert "还原" in mon.btn_solo.text()
+    solo_h = _vb_height(mon)
+    assert solo_h > h14 * 3, f"放大没生效: {h14:.1f}px -> {solo_h:.1f}px"
+
+
+def test_restore_brings_back_all_14(mon, app):
+    mon.resize(1200, 760); mon.show()
+    _push(mon, [-112666.0 + (i % 7) for i in range(600)])
+    mon._solo_plot(2)
+    mon._restore_grid()
+    app.processEvents()
+    assert all(p.isVisible() for p in mon.plots)
+    assert mon._solo is None
+    assert "单通道放大" in mon.btn_solo.text()
+
+
+def test_solo_button_targets_last_clicked_plot(mon):
+    """工具栏按钮放大"最近点中的那一张"，不然现场不知道该点哪。"""
+    mon._focus_idx = 3
+    mon._toggle_solo()
+    assert mon._solo == 3
+    # 窗口没 show 时 isVisible() 恒为 False，这里看"有没有被显式隐藏"
+    assert not mon.plots[3].isHidden() and mon.plots[0].isHidden()
+    mon._toggle_solo()
+    assert mon._solo is None and not mon.plots[0].isHidden()
+
+
+def test_auto_scale_fills_the_height(mon):
+    """量程要贴着峰值：±45 的正弦必须占满 85% 以上，否则"看不出浮动"。"""
+    np = pytest.importorskip("numpy")
+    t = np.arange(5000) / 500.0
+    _push(mon, (-112666.0 + 45.0 * np.sin(2 * np.pi * 8.0 * t)).tolist())
+    lo, hi = mon.plots[0].getViewBox().viewRange()[1]
+    assert hi > lo
+    assert 90.0 / (hi - lo) > 0.85, f"峰峰 90 只占 {90.0 / (hi - lo):.0%} 屏高"

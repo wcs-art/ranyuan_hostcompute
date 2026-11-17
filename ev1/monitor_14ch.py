@@ -18,6 +18,13 @@ AUTO_Q_HI = 99.5
 #: 极端值超过鲁棒半幅的这么多倍才判为毛刺, 否则照样算进量程
 #: (真实的大幅波动如眨眼/运动不该被裁掉)
 AUTO_GLITCH_X = 4.0
+#: 自动量程在峰值上再留的余量。1.05 = 曲线几乎贴着上下边框,
+#: 这是"看得出浮动"的关键: 留太多就是一条压扁的线(现场原话: 太紧凑)。
+AUTO_PAD = 1.05
+#: 量程下限, 防止纯噪声被放大成满屏（那不是"浮动", 是没有信号）
+AUTO_MIN_SCALE = 10.0
+#: 量程回差: 变化不到 ±15% 就不改档, 否则每帧跟着噪声跳
+AUTO_HYST = 1.15
 
 class Monitor14(QtWidgets.QMainWindow):
     def __init__(self, eeg_names=None, sim=False):
@@ -90,6 +97,11 @@ class Monitor14(QtWidgets.QMainWindow):
         self.btn_follow.setCheckable(True); self.btn_follow.setChecked(True)
         self.btn_follow.setToolTip("取消勾选后不再自动改时间轴与量程，方便放大看细节")
         self.btn_follow.toggled.connect(self._set_follow)
+        # 14 图并排时每张只有几十像素高，波形看起来是一条平线。单通道放大是主路径，
+        # 双击子图也能触发；这个按钮是给"不知道能双击"的人留的入口。
+        self.btn_solo = QtWidgets.QPushButton("⤢ 单通道放大")
+        self.btn_solo.setToolTip("放大当前点中的子图（也可直接双击子图，Esc 还原）")
+        self.btn_solo.clicked.connect(self._toggle_solo)
         self.lbl = QtWidgets.QLabel("丢包率 0.0% | 电量 --% | seq连续 OK")
         # S3: 各通道信号质量的实时显示(此前只在内存里算, 从没画到界面上)
         self.lbl_quality = QtWidgets.QLabel("通道质量 --")
@@ -97,7 +109,7 @@ class Monitor14(QtWidgets.QMainWindow):
         self.btn_verify = QtWidgets.QPushButton("离线自检")
         self.btn_verify.clicked.connect(self._open_verify)
         for w in (self.btn_pause, self.cmb_fnirs, self.cmb_win, self.cmb_scale,
-                  self.cmb_fscale, self.btn_follow, self.btn_verify, self.lbl):
+                  self.cmb_fscale, self.btn_follow, self.btn_solo, self.btn_verify, self.lbl):
             bar.addWidget(w)
         lay.addLayout(bar)
         qrow = QtWidgets.QHBoxLayout()
@@ -129,6 +141,12 @@ class Monitor14(QtWidgets.QMainWindow):
         gl = QtWidgets.QGridLayout(); lay.addLayout(gl)
         names = ch_labels
         ncols = 2 if self.n_total <= 16 else 4
+        self._gl = gl; self._names = names; self._ncols = ncols
+        self._nrows = (len(names) + ncols - 1) // ncols
+        #: 单通道放大时独占全屏的是哪一路；None = 14 图并排
+        self._solo = None
+        #: 最近一次点到的子图，供工具栏按钮"放大当前"用
+        self._focus_idx = 0
         for r, n in enumerate(names):
             p = pg.PlotWidget(title=n); p.showGrid(x=True, y=True)
             p.setMouseEnabled(x=True, y=True)  # 缩放
@@ -145,7 +163,20 @@ class Monitor14(QtWidgets.QMainWindow):
             tip = pg.TextItem("等待数据…", color="#909090", anchor=(0.5, 0.5))
             tip.setPos(self.win_s / 2.0, 0.0); tip.hide()
             p.addItem(tip); self._tips.append(tip)
+            # 14 图并排时每张只有几十像素高，起伏看不出来。双击任何一张 -> 单独放大
+            p.scene().sigMouseClicked.connect(lambda ev, k=r: self._on_plot_click(ev, k))
             gl.addWidget(p, r // ncols, r % ncols); self.plots.append(p); self.curves.append(c)
+        # 键盘 Esc 还原（现场全屏看细节后不用去找鼠标）。
+        # 主界面是把本窗口的 centralWidget 嵌进去用的，这里不能用 WindowShortcut
+        # —— 那个"窗口"从来没显示过，快捷键永远不触发。
+        try:
+            from PyQt5 import QtGui
+            sc = QtWidgets.QShortcut(QtGui.QKeySequence("Esc"), self)
+            sc.setContext(QtCore.Qt.WidgetWithChildrenShortcut)
+            sc.activated.connect(self._restore_grid)
+            self._esc = sc
+        except Exception:  # noqa: BLE001
+            self._esc = None
         self.t0 = time.time()
         self.buf_eeg = np.zeros((self.n_eeg, int(self.fs_eeg*30)))
         self.buf_fn = np.zeros((10, int(self.fs_fnirs*30)))
@@ -162,7 +193,51 @@ class Monitor14(QtWidgets.QMainWindow):
         self._metrics = {"brain_active": 50.0, "brain_relax": 50.0, "focus": 50.0, "hr_bpm": 0.0}
     def _toggle_ch(self, k: int, v: bool):
         self.ch_enable[k] = v
-        self.plots[k].setVisible(v)
+        # 单通道放大时只让那一路可见，勾选框不要把它整体打开
+        self.plots[k].setVisible(v and (self._solo in (None, k)))
+    # ---- 单通道放大 ----
+    def _title_of(self, i: int) -> str:
+        return self._names[i] if i < len(self._names) else f"CH{i+1}"
+
+    def _on_plot_click(self, ev, i: int):
+        """点一下就记住"当前是哪一路"，双击则放大/还原。"""
+        self._focus_idx = i
+        if ev.double():
+            if self._solo == i:
+                self._restore_grid()
+            else:
+                self._solo_plot(i)
+
+    def _toggle_solo(self):
+        if self._solo is None:
+            self._solo_plot(self._focus_idx)
+        else:
+            self._restore_grid()
+
+    def _solo_plot(self, i: int):
+        """把第 i 路铺满整个绘图区：14 图并排时每张才几十像素高，起伏看不出来。"""
+        if not (0 <= i < len(self.plots)):
+            return
+        self._solo = i
+        for j, p in enumerate(self.plots):
+            p.setVisible(j == i)
+        # 重新 addWidget 到整块格子里，才会真正占满（仅仅隐藏其它图只会留出空格）
+        self._gl.addWidget(self.plots[i], 0, 0, self._nrows, self._ncols)
+        self.plots[i].setTitle(f"{self._title_of(i)}　单通道放大（双击或 Esc 还原）")
+        self.btn_solo.setText("⤢ 还原 14 图")
+        self._reset_x_range()
+
+    def _restore_grid(self):
+        """还原成 14 图并排（按通道开关决定各自是否可见）。"""
+        if self._solo is None and self.btn_solo.text().startswith("⤢ 还原"):
+            return
+        self._solo = None
+        for r, p in enumerate(self.plots):
+            self._gl.addWidget(p, r // self._ncols, r % self._ncols)
+            p.setTitle(self._title_of(r))
+            p.setVisible(self.ch_enable[r])
+        self.btn_solo.setText("⤢ 单通道放大")
+        self._reset_x_range()
     def _set_eeg_scale(self, i: int):
         """幅度标尺: 0=自动, 1~3=固定 ±100/±200/±500μV。"""
         self.eeg_scale_auto = (i == 0)
@@ -241,18 +316,12 @@ class Monitor14(QtWidgets.QMainWindow):
             return
         if not np.isfinite(peak) or peak <= 0:
             return
-        target = peak * 1.15                     # 留 15% 余量, 峰值不贴边
-        base = 10.0 ** math.floor(math.log10(max(target, 1.0)))
-        want = 10.0
-        for k in (1.0, 2.0, 5.0, 10.0):          # 取 1/2/5×10^n 这一档, 刻度好读
-            if target <= k * base:
-                want = k * base
-                break
-        want = max(want, 10.0)                   # 下限 ±10μV, 避免噪声把量程压到看不见
-        # 回差: 只在跨过阈值时才改, 否则量程会随每个心动周期来回跳。
-        # 下降放宽到 1/4: 开机冲击(几万)过去后必须能降回来, 否则会被一次性拉高锁死,
-        # 之后整段信号都被压成一条平线。
-        if want > self.eeg_scale * 1.6 or want < self.eeg_scale / 4.0:
+        # 量程直接贴合峰值，不再按 1/2/5 取整：
+        # 取整会让 126 的峰峰落到 100 档（只占 63%）甚至 200 档（31%），
+        # 现场的原话就是"太紧凑，看不出波形浮动"。VOFA 的 Auto 也是贴极值。
+        want = max(peak * AUTO_PAD, AUTO_MIN_SCALE)
+        # 回差收到 ±15%：贴合得紧，但不会每一帧都跟着噪声跳档
+        if want > self.eeg_scale * AUTO_HYST or want < self.eeg_scale / AUTO_HYST:
             self.eeg_scale = want
     def _open_verify(self):
         from verify_center import VerifyCenter
@@ -699,23 +768,25 @@ class Monitor14(QtWidgets.QMainWindow):
                 rs = self._robust_span(seg)
                 mid = rs[0] if rs is not None else float(np.median(seg))
                 if np.isfinite(mid):
-                    self.plots[i].setYRange(mid - self.eeg_scale, mid + self.eeg_scale)
+                    # padding=0: pyqtgraph 默认再给 2% 边距，叠上自己的余量就更扁了
+                    self.plots[i].setYRange(mid - self.eeg_scale, mid + self.eeg_scale,
+                                            padding=0)
                 else:
-                    self.plots[i].setYRange(-self.eeg_scale, self.eeg_scale)
+                    self.plots[i].setYRange(-self.eeg_scale, self.eeg_scale, padding=0)
             else:
                 # 手动档: 保持 ±量程 的绝对语义, 不跟随信号漂移
-                self.plots[i].setYRange(-self.eeg_scale, self.eeg_scale)
+                self.plots[i].setYRange(-self.eeg_scale, self.eeg_scale, padding=0)
         for i in range(10):
             k = self.n_eeg + i
             if not (self.ch_enable[k] and self._ch_ok[k]):
                 self.curves[k].setData([], [])
                 self._tips[k].setText("无数据（本链路未发送该通道）")
                 self._tips[k].show()
-                self.plots[k].setYRange(-0.01, 0.01)
+                self.plots[k].setYRange(-0.01, 0.01, padding=0)
                 continue
             self._tips[k].hide()
             self.curves[k].setData(tf, self.buf_fn[i, -m:])
-            self.plots[k].setYRange(-self.fnirs_scale, self.fnirs_scale)
+            self.plots[k].setYRange(-self.fnirs_scale, self.fnirs_scale, padding=0)
 
 def main():
     app = QtWidgets.QApplication(sys.argv)
