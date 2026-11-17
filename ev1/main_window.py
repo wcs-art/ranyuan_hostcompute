@@ -12,6 +12,7 @@ class ClassicMainWindow(QtWidgets.QMainWindow):
         self.setWindowTitle(self._base_title)
         self.resize(1600, 950)
         self.source = None          # 由 main() 注入或界面"连接"按钮创建, 用于读链路统计
+        self._link_error = None     # 打开失败的原文: 定时刷新不许把它冲掉
         self._link_t0 = time.time()
         cw = QtWidgets.QWidget(); self.setCentralWidget(cw)
         # ---- 左: 波形区 ----
@@ -200,12 +201,19 @@ class ClassicMainWindow(QtWidgets.QMainWindow):
         except Exception as e:  # noqa: BLE001 - 缺依赖不该让界面挂掉, 但要说出来
             self._say(f"[WARN] 串口列表不可用({type(e).__name__})，可手输口名如 COM3", False)
         self.cmb_com.clear()
-        self.cmb_com.addItems(ports or ["COM3"])
-        if cur and cur not in ports:
-            self.cmb_com.addItem(cur)
+        if ports:
+            self.cmb_com.addItems(ports)
+        # 保留上一个用过的口名, 但不再塞一个不存在的 COM3 占位 —— 那会让人以为端口在
         if cur:
+            if cur not in ports:
+                self.cmb_com.addItem(cur)
             self.cmb_com.setCurrentText(cur)
-        self._say(f"串口列表: {', '.join(ports) if ports else '未发现（可手输）'}")
+        try:
+            self.cmb_com.lineEdit().setPlaceholderText(
+                "可手输，如 COM3" if ports else "未发现串口 · 插好后点「刷新端口」")
+        except Exception:  # noqa: BLE001 - 只影响提示文字, 不影响功能
+            pass
+        self._say(f"串口列表: {', '.join(ports) if ports else '未发现（可手输口名）'}")
 
     def _toggle_link(self):
         if self.source is None:
@@ -231,8 +239,7 @@ class ClassicMainWindow(QtWidgets.QMainWindow):
             src.start()
         except Exception as e:  # noqa: BLE001 - 打不开端口是最常见的现场故障
             self._say(f"[FAIL] 连接失败({kind}): {e}", False)
-            self.lbl_link.setText(f"链路: 打开失败 — {e}")
-            self.lbl_link.setStyleSheet("color:#b00020;")
+            self.show_link_error(str(e))
             return
         self._install_source(src)
         where = f"{com} @{baud}" if kind in ("text", "serial") else kind
@@ -250,6 +257,7 @@ class ClassicMainWindow(QtWidgets.QMainWindow):
             except Exception as e:  # noqa: BLE001
                 self._say(f"[WARN] 关闭链路异常: {e}", False)
         self.source = None
+        self._link_error = None
         self.mon.detach_receiver()
         self.setWindowTitle(self._base_title)
         for i, p in enumerate(self.mon.plots[:self.mon.n_eeg]):
@@ -261,9 +269,44 @@ class ClassicMainWindow(QtWidgets.QMainWindow):
         if not silent:
             self._say("已断开数据源")
 
+    def show_link_error(self, msg: str):
+        """链路打不开：把原因和下一步写清楚，别让人只看到一句英文异常。
+
+        注意 Windows 的坑：口名不存在时 pyserial 报的是 PermissionError(拒绝访问)，
+        不是 FileNotFoundError，照字面翻译会把"没插线"说成"被占用"。所以先按
+        实际端口列表判断这个口到底在不在，再决定提示。
+        """
+        import re
+        text = str(msg)
+        low = text.lower()
+        tip = "检查线缆、驱动与口名后重试；也可点「刷新端口」重新扫描"
+        m = re.search(r"(COM\d+)", text, re.I)
+        if m:
+            port = m.group(1).upper()
+            try:
+                from serial.tools import list_ports
+                ports = [p.device.upper() for p in list_ports.comports()]
+            except Exception:  # noqa: BLE001 - 没装 pyserial 时无法判断, 退回按字面提示
+                ports = None
+            if ports is not None and port not in ports:
+                have = "、".join(ports) if ports else "当前一个串口都没有"
+                tip = (f"{port} 不存在：线没插 / 驱动没装 / 口名不对。"
+                       f"可用端口：{have} —— 插好后点「刷新端口」再连接")
+            elif "permission" in low or "access is denied" in low or "拒绝访问" in text:
+                tip = f"{port} 被占用：先断开 VOFA、串口助手等工具，再点「连接并采集」"
+        elif "filenotfound" in low or "找不到" in text or "could not open port" in low:
+            tip = "端口不存在：线没插 / 驱动没装 / 口名不对 —— 点「刷新端口」重新扫描"
+        elif "permission" in low or "access is denied" in low or "拒绝访问" in text:
+            tip = "端口被占用：先断开 VOFA、串口助手等工具，再点「连接并采集」"
+        self.lbl_link.setText(f"链路: 打开失败 — {text}\n⚠ {tip}")
+        self.lbl_link.setStyleSheet("color:#b00020;")
+        self.btn_conn.setText("▶ 连接并采集")
+        self._link_error = text
+
     def _install_source(self, src):
         """接管一个已启动的数据源：清旧缓冲、挂到波形区、按格式加标注。"""
         self.source = src
+        self._link_error = None
         self.mon.attach_receiver(src)
         kind = getattr(src, "kind", "")
         title = self._base_title
@@ -299,7 +342,9 @@ class ClassicMainWindow(QtWidgets.QMainWindow):
     def _refresh_link(self):
         """刷新链路行：区分「没有包」「有包但没帧」「有错误」三种情况。"""
         if self.source is None:
-            self.lbl_link.setText("链路: 未接入数据源（不做任何显示，也不造数）")
+            if self._link_error:
+                return          # 打开失败的提示要留着, 不能被 500ms 定时刷新冲掉
+            self.lbl_link.setText("链路: 未连接（选好类型和端口后点「连接并采集」）")
             self.lbl_link.setStyleSheet("color:#666666;")
             return
         try:
@@ -567,18 +612,28 @@ class ClassicMainWindow(QtWidgets.QMainWindow):
 MainWindow = ClassicMainWindow
 
 
-def main(source=None, extra_cols: bool = False):
-    """source 为 None 时不产生任何数据；接上后按名字传参推给界面。"""
+def main(source=None, extra_cols: bool = False, start_error=None):
+    """source 为 None 时不产生任何数据；接上后按名字传参推给界面。
+
+    start_error: 启动时链路打不开的原因。此时窗口照常打开、参数预填好，
+                 让人在界面里改端口重试，而不是看到弹窗后程序消失。
+    """
     app = QtWidgets.QApplication(sys.argv)
     w = ClassicMainWindow()
+    w.mon.extra_cols = bool(extra_cols)
     if source is not None:
-        w.mon.extra_cols = bool(extra_cols)
+        w._sync_ui_to_source(source)     # 先把参数填进下拉框, 失败时也能一键重试
+    if start_error:
+        w._say(f"[FAIL] 链路启动失败: {start_error}", False)
+        w.show_link_error(start_error)
+    elif source is not None:
         try:
             source.start()          # 幂等: main() 里可能已经开过
         except Exception as e:      # noqa: BLE001 - 让窗口照开, 原因显示在链路栏
             w._say(f"[FAIL] 链路启动失败: {e}", False)
-        w._install_source(source)
-        w._sync_ui_to_source(source)
+            w.show_link_error(str(e))
+        else:
+            w._install_source(source)
     else:
         w._say("未接入数据源：选好类型与端口后点「连接并采集」")
     w.showMaximized()

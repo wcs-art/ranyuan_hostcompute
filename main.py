@@ -68,4 +68,18 @@ def _log_file() -> Path:
     return LOG_DIR / f"run_{datetime.datetime.now():%Y%m%d}.log"
 def log(msg: str) -> None:
     """同时写 stderr 与 logs/run_YYYYMMDD.log。打包成 exe(无控制台)后,
-    文件日志是唯一能留下证据的�
+    文件日志是唯一能留下证据的地方。"""
+    line = f"{datetime.datetime.now():%H:%M:%S} {msg}"
+    try:
+        print(line, flush=True)
+    except Exception:  # noqa: BLE001 - 无控制台时 print 可能失败
+        pass
+    try:
+        with _log_file().open("a", encoding="utf-8") as f:
+            f.write(line + "\n")
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def popup(title: str, msg: str) -> None:
+    """没有控制台时用系统弹窗告知原因, 避免"双击闪退、什么都不知�
