@@ -442,8 +442,15 @@ def main(source=None, extra_cols: bool = False):
             w._say(f"[FAIL] 链路启动失败: {e}", False)
         w.mon.attach_receiver(source)
         # 合成数据必须一眼可辨, 否则现场会把它当成真机波形
-        if getattr(source, "kind", "") == "sim":
+        kind = getattr(source, "kind", "")
+        if kind == "sim":
             w.setWindowTitle(w.windowTitle() + "  【模拟数据 · 非真机】")
+        elif kind in ("text", "text-file"):
+            # 文本格式不带 CRC/序号/时间戳, 单位也未换算: 这三件事必须写在标题栏上,
+            # 否则会被当成"14 通道全功能已跑通"
+            w.setWindowTitle(w.windowTitle() + "  【文本原始值 · 未换算 · 无 CRC/丢包校验】")
+            for i, p in enumerate(w.mon.plots[:w.mon.n_eeg]):
+                p.setTitle(f"CH{i+1}（原始值）")
     w.showMaximized()
     sys.exit(app.exec_())
 

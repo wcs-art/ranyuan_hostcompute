@@ -21,9 +21,22 @@ run.bat
 
 ```bash
 python main.py --source=real  --proto=serial --com=COM3 --baud=921600
-python main.py --source=replay --file=capture/demo.bin
-python main.py --source=fake
+python main.py --source=text  --com=COM3 --baud=921600
+python main.py --source=text  --replay=capture/text_field.bin
+python main.py --source=dry   --replay=capture/demo.bin
+python main.py --source=sim
 ```
+
+## 有线的两种数据格式（不要混用）
+
+| 格式 | 启动参数 | 内容 |
+|---|---|---|
+| AA55 二进制帧 | `--source=real --proto=serial` | 合同 F2 帧：帧头、包序号、CRC16、双时间戳、事件标记 |
+| ASCII 文本行 | `--source=text` | 实测固件输出：每行一个十进制值 + `\r\n`，约 500 行/秒 |
+
+文本格式不带帧头、序号、CRC、时间戳与事件，因此界面会标注「文本原始值 · 未换算 · 无 CRC/丢包校验」：
+丢包统计与 CRC 校验不适用，数值为原始值（单位待定），指标面板不参与计算。
+该格式**无法满足合同 F2 的验收判据**，两者不是同一条链路的两种写法。
 
 数据源与协议（`v1` 104 字节 / `v1r5` 152 字节 / `compat90` 90 字节）在 `config/run.json` 中切换。
 

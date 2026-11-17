@@ -296,7 +296,22 @@ def make_source(kind: str = "real", **kw) -> Source:
         if "path" not in kw or not kw["path"]:
             raise SystemExit("--source=dry 需要 --replay=<录制字节文件路径>")
         return DrySource(kw["path"])
-    raise SystemExit(f"未知 --source={kind}, 可选 sim / real / dry")
+    # 文本行链路(有线固件的 ASCII 输出)。不是 AA55 二进制帧, 解析路径完全不同,
+    # 因此不经过 device_frame.configure 的布局/增益折算。
+    if kind in ("text", "serial-text", "firewater"):
+        # 给了 --replay 就走文件回放, 否则开串口
+        if kw.get("path"):
+            from text_source import TextFileSource
+            return TextFileSource(kw["path"])
+        from text_source import TextSource
+        return TextSource(com=kw.get("com") or "COM3", baud=kw.get("baud") or 921600,
+                          raw_dump=kw.get("raw_dump"))
+    if kind in ("text-file", "textfile"):
+        from text_source import TextFileSource
+        if "path" not in kw or not kw["path"]:
+            raise SystemExit("--source=text-file 需要 --replay=<文本文件路径>")
+        return TextFileSource(kw["path"])
+    raise SystemExit(f"未知 --source={kind}, 可选 sim / real / dry / text / text-file")
 
 
 def parse_argv(argv: list[str], base: dict | None = None) -> dict:

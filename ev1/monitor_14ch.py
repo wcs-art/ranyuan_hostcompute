@@ -131,9 +131,22 @@ class Monitor14(QtWidgets.QMainWindow):
         if not self.eeg_scale_auto:
             self.eeg_scale = (100.0, 200.0, 500.0)[max(0, min(i - 1, 2))]
     def _auto_eeg_scale(self, seg):
-        """按实测峰值自动定量程，只改显示范围，不改数据本身。"""
+        """按实测峰峰值定半幅量程，只改显示范围，不改数据本身。
+
+        两处必须注意：
+        1) 用 (max-min)/2 而不是 max(|x|)：真实信号带直流偏置时（如原始码值在
+           -8700 附近），按绝对值定量程会得到 20000 却把波形压在框边。
+        2) 跳过最大值等于最小值的通道：单列文本模式下只有 CH1 有数据，其余通道
+           全是 0 补位，混进来会把峰峰值从 3000 拉到 12000，量程直接锁死在最高档。
+        """
         try:
-            peak = float(np.max(np.abs(seg))) if seg.size else 0.0
+            spans = []
+            for row in np.atleast_2d(seg):
+                if row.size:
+                    lo, hi = float(np.min(row)), float(np.max(row))
+                    if hi != lo:                 # 常数通道 = 没有数据，不参与
+                        spans.append(hi - lo)
+            peak = max(spans) / 2.0 if spans else 0.0
         except Exception:  # noqa: BLE001
             return
         if not np.isfinite(peak) or peak <= 0:
@@ -146,8 +159,10 @@ class Monitor14(QtWidgets.QMainWindow):
                 want = k * base
                 break
         want = max(want, 10.0)                   # 下限 ±10μV, 避免噪声把量程压到看不见
-        # 回差: 只在跨过 1.6 倍时才改, 否则量程会随每个心动周期来回跳
-        if want > self.eeg_scale * 1.6 or want < self.eeg_scale / 1.6:
+        # 回差: 只在跨过阈值时才改, 否则量程会随每个心动周期来回跳。
+        # 下降放宽到 1/4: 开机冲击(几万)过去后必须能降回来, 否则会被一次性拉高锁死,
+        # 之后整段信号都被压成一条平线。
+        if want > self.eeg_scale * 1.6 or want < self.eeg_scale / 4.0:
             self.eeg_scale = want
     def _open_verify(self):
         from verify_center import VerifyCenter
@@ -375,8 +390,9 @@ class Monitor14(QtWidgets.QMainWindow):
                 self.buf_met = np.zeros((4, 600))
             import numpy as _np
             ppg = float(_np.mean(raw)) if raw is not None else 1000.0
-            self._sm.push(float(list(eeg_uv)[0]), float(_np.mean(hbo)),
-                          float(_np.mean(hbr)), ppg)
+            if not getattr(self, "unit_unknown", False):
+                self._sm.push(float(list(eeg_uv)[0]), float(_np.mean(hbo)),
+                              float(_np.mean(hbr)), ppg)
         except Exception:
             pass
         if self._recv % 25 == 0:
@@ -450,6 +466,10 @@ class Monitor14(QtWidgets.QMainWindow):
         """接实机：receiver 需提供 poll_frames()，调用后界面改为读设备数据。"""
         self._receiver = receiver
         self.sim = False
+        # 文本链路给的是未换算的原始值（单位未确认）。它的值域和 μV 差上千倍，
+        # 直接喂指标算法会把 brain_relax 算成常数并触发 exp 溢出。这里整段不参与，
+        # 指标保持默认值，比显示一个错的数好。
+        self.unit_unknown = getattr(receiver, "kind", "") in ("text", "text-file")
 
     def _update_rate(self):
         """用实测帧率校正显示采样率。"""
@@ -491,13 +511,27 @@ class Monitor14(QtWidgets.QMainWindow):
         # 长度必须夹到缓冲宽度：不相等时绘图库抛异常，PyQt5 会直接 abort 退出
         n = max(32, min(n, self.buf_eeg.shape[1]))
         m = max(16, min(m, self.buf_fn.shape[1]))
+        # 缓冲还没填满时，前面的 0 是补位不是数据。拿它算峰峰值会把量程放大一倍
+        # （0 到 -8000 的跳变），之后信号一直被压成平线。只画已收到的样本。
+        if self._recv and self._recv < n:
+            n = max(2, int(self._recv))
         if self.eeg_scale_auto and self._recv:
             self._auto_eeg_scale(self.buf_eeg[:, -n:])
         te = np.arange(n)/max(self.fs_eeg, 1e-6); tf = np.arange(m)/max(self.fs_fnirs, 1e-6)
         for i in range(self.n_eeg):
             if self.ch_enable[i]:
-                self.curves[i].setData(te, self.buf_eeg[i, -n:])
-                self.plots[i].setYRange(-self.eeg_scale, self.eeg_scale)
+                seg = self.buf_eeg[i, -n:]
+                self.curves[i].setData(te, seg)
+                if self.eeg_scale_auto and seg.size:
+                    # 自动档: 窗口跟着信号中心走, 带直流偏置的原始值也能看清细节
+                    mid = float((np.max(seg) + np.min(seg)) / 2.0)
+                    if np.isfinite(mid):
+                        self.plots[i].setYRange(mid - self.eeg_scale, mid + self.eeg_scale)
+                    else:
+                        self.plots[i].setYRange(-self.eeg_scale, self.eeg_scale)
+                else:
+                    # 手动档: 保持 ±量程 的绝对语义(μV 标尺), 不跟随信号漂移
+                    self.plots[i].setYRange(-self.eeg_scale, self.eeg_scale)
         for i in range(10):
             if self.ch_enable[self.n_eeg+i]:
                 self.curves[self.n_eeg+i].setData(tf, self.buf_fn[i, -m:])
