@@ -184,6 +184,11 @@ class Monitor14(QtWidgets.QMainWindow):
             # 合同 S1 要求「时间轴统一」: 横轴必须是同一个绝对量(秒), 不能各图各的
             p.setLabel('bottom', '时间', units='s')
             self._set_left_label(p, r)
+            # 14 图并排时每张的可绘区只有二三十像素高，六位刻度（-104300）根本放不下，
+            # 会叠成一团黑糊，现场反而以为"纵轴坏了、数值变了"。
+            # 这里只保留刻度线和网格，数值到「单通道放大」里看，那里空间够、写的是原值。
+            p.getAxis('left').setStyle(showValues=False)
+            p.getAxis('bottom').setStyle(showValues=(r >= self.n_total - ncols))
             p.setXRange(0, self.win_s, padding=0)
             # 带上序号: 之后要按"用户缩的是哪一张"取数据并统一到 14 张图
             p.getViewBox().sigRangeChangedManually.connect(
@@ -217,6 +222,9 @@ class Monitor14(QtWidgets.QMainWindow):
         big_font = QtGui.QFont(); big_font.setPointSize(10)
         for ax in ('bottom', 'left'):
             self._big.getAxis(ax).setStyle(tickFont=big_font)
+        # 六位刻度（-104300）在默认宽度里会被裁掉首尾，放大页专门留够空间、写全原文数字
+        self._big.getAxis('left').setStyle(tickTextWidth=86)
+        self._big.getAxis('left').setStyle(showValues=True)
         self._no_si_prefix(self._big)
         self._big_curve = self._big.plot(pen="y")
         self._big_tip = pg.TextItem("等待数据…", color="#909090", anchor=(0.5, 0.5))
@@ -983,6 +991,9 @@ class Monitor14(QtWidgets.QMainWindow):
             tip.hide()
             curve.setData(x, y)
             if not self._follow:
+                # 手动缩放中: 不改量程（否则每 40ms 被抢回去），但如果这一段数据
+                # 整段跑出了 Y 窗口，曲线会凭空消失、看着像"数据没了"，这里拉回来。
+                self._ensure_y_visible(plot, y)
                 return                     # 手动缩放中: 不再抢用户的视野
             if self.eeg_scale_auto and y.size:
                 # 自动档: 窗口跟着信号中心走, 带直流偏置的原始值也能看清细节
@@ -1006,6 +1017,34 @@ class Monitor14(QtWidgets.QMainWindow):
         curve.setData(x, y)
         if self._follow:
             plot.setYRange(-self.fnirs_scale, self.fnirs_scale, padding=0)
+        else:
+            self._ensure_y_visible(plot, y, self.fnirs_scale)
+
+    def _ensure_y_visible(self, plot, y, half=None):
+        """手动缩放状态下，只在曲线整段跑出视野时把 Y 拉回来。
+
+        拖/缩横轴看历史时，那一段的直流偏置可能和当前 Y 窗口差几千（原始值会漂），
+        曲线就整段画在框外，屏幕上什么都没有，现场会当成"数据丢了"。
+        只在交集不足 15% 时才动 —— 用户刻意放大某个电平时，视野里还有数据，不抢。
+        """
+        try:
+            ylo, yhi = plot.getViewBox().viewRange()[1]
+            dlo, dhi = float(np.min(y)), float(np.max(y))
+        except Exception:  # noqa: BLE001
+            return
+        if not (np.isfinite(ylo) and np.isfinite(yhi)
+                and np.isfinite(dlo) and np.isfinite(dhi)):
+            return
+        span = yhi - ylo; dspan = dhi - dlo
+        if span <= 0 or dspan < 0:
+            return
+        inside = min(yhi, dhi) - max(ylo, dlo)
+        if inside > 0.15 * max(min(span, dspan), 1e-12):
+            return
+        rs = self._robust_span(y)
+        mid = rs[0] if rs is not None else (dlo + dhi) / 2.0
+        want = max(float(half if half is not None else self.eeg_scale), dspan / 2.0 * 1.05)
+        plot.setYRange(mid - want, mid + want, padding=0)
 
 def main():
     app = QtWidgets.QApplication(sys.argv)

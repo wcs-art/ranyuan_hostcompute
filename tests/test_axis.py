@@ -392,3 +392,54 @@ def test_zoom_is_shared_by_all_plots(mon):
     mon._tick(force=True)
     for i in (0, 3, 9, 13):
         assert _xrange(mon.plots[i]) == (5.0, 15.0), f"第 {i} 张图没跟上: {_xrange(mon.plots[i])}"
+
+
+# ---- 放大缩小不许改数值本身 ---------------------------------------------------
+def test_grid_axis_hides_numbers_and_big_shows_raw(mon):
+    """14 图太小放不下六位刻度（-104300），会叠成黑糊，现场看着像"纵轴坏了"。
+
+    所以：网格页不画刻度数字（保留刻度线与单位标签），单通道放大页写原始数字。
+    两张图用的是同一份数据，数值必须完全一致（都不得被 SI 前缀缩成 -104.3）。
+    """
+    for p in mon.plots:
+        assert p.getAxis('left').style['showValues'] is False, "14 图还在画挤不下的六位刻度"
+        assert p.getAxis('left').autoSIPrefix is False
+    mon._solo_plot(0)
+    ax = mon._big.getAxis('left')
+    assert ax.style['showValues'] is True, "放大页必须能读到数值"
+    assert ax.autoSIPrefix is False
+    assert ax.tickStrings([-104300.0], 1.0, 1) == ['-104300']
+
+
+def test_zoom_does_not_change_the_numbers(mon, app):
+    """缩横轴只是换一段数据看，纵轴刻度必须还是原始量级，不能变成 -104.3。"""
+    mon.fs_eeg = mon.fs_fnirs = 100.0
+    _push(mon, [-104300.0 + (i % 9) for i in range(3000)])
+    mon.resize(1200, 700); mon.show()
+    mon._tick(force=True); app.processEvents()
+    before = mon.plots[0].getAxis('left').tickStrings(
+        list(mon.plots[0].getViewBox().viewRange()[1]), 1.0, 1)
+    mon._solo_plot(0)
+    mon._big.setXRange(5.0, 12.0, padding=0)
+    mon._on_manual_zoom(-1)
+    mon._tick(force=True); app.processEvents()
+    after = mon._big.getAxis('left').tickStrings(
+        list(mon._big.getViewBox().viewRange()[1]), 1.0, 1)
+    assert all(round(float(t)) <= -104000 for t in after), f"缩放后刻度被改写了: {after}"
+    assert all('.' not in t for t in after), f"刻度出现小数，说明值被缩放了: {after}"
+    assert len(before) and len(after)
+
+
+def test_curve_stays_in_view_when_x_zoomed(mon):
+    """拖到直流偏置不同的另一段时，曲线不许整段跑出 Y 窗口（否则看着像没数据）。"""
+    mon.fs_eeg = mon.fs_fnirs = 100.0
+    # 前 10 s 在 -104300 附近，后 10 s 漂到 -101300（差 3000）
+    _push(mon, [-104300.0 + (i % 5) for i in range(1000)] +
+              [-101300.0 + (i % 5) for i in range(1000)])
+    mon.plots[0].setXRange(10.0, 20.0, padding=0)
+    mon._on_manual_zoom(0)
+    mon._tick(force=True)
+    lo, hi = mon.plots[0].getViewBox().viewRange()[1]
+    y = mon.curves[0].getData()[1]
+    assert float(min(y)) > lo and float(max(y)) < hi, \
+        f"曲线跑到窗口外: 数据 {min(y):.0f}~{max(y):.0f}, 视野 {lo:.0f}~{hi:.0f}"
