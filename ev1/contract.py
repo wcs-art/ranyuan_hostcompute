@@ -149,6 +149,8 @@ def frame_to_ui_dict(fr: Frame) -> dict:
         "seq": fr.seq,
         "ts_abs_ms": int(fr.t_abs_ms or 0),
         "eeg_uv": [float(v) for v in fr.eeg_uv],
+        # 这一帧真实带了几路 EEG。界面只画这几路，其余不画（不留假平线）。
+        "eeg_n": len(fr.eeg_uv),
         "hbo": list(fr.hbo) if fr.hbo is not None else [0.0] * N_FNIRS,
         "hbr": list(fr.hbr) if fr.hbr is not None else [0.0] * N_FNIRS,
         "raw": _flatten_raw(fr.fnirs_raw),

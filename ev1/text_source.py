@@ -167,6 +167,9 @@ class TextDecoder:
             "seq": self.seq,
             "ts_abs_ms": 0,
             "eeg_uv": eeg,
+            # 本帧真实带了几路 EEG。界面只画这几路，其余通道是补 0 的占位，
+            # 画出来就是一条假平线（现场会误判成"信号一直是 0"）。
+            "eeg_n": min(n, N_EEG),
             "hbo": [0.0] * N_FNIRS,
             "hbr": [0.0] * N_FNIRS,
             "raw": raw,

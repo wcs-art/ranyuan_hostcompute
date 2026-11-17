@@ -48,6 +48,10 @@ class Monitor14(QtWidgets.QMainWindow):
         # 否则每 40ms 被 setXRange/setYRange 抢回去, "支持缩放"等于没有。
         self._follow = True
         self.ch_enable = [True]*self.n_total
+        # 每个通道是否真的收到过数据。文本链路只有 1 列时, 其余通道是补 0 的,
+        # 若照画就会得到一条贴 0 的假平线, 现场会当成"信号一直是 0"。
+        self._ch_ok = [False]*self.n_total
+        self._t_rx = None            # 最近一次收到帧的时刻, 用于判断"停发"
         cw = QtWidgets.QWidget(); self.setCentralWidget(cw); lay = QtWidgets.QVBoxLayout(cw)
         bar = QtWidgets.QHBoxLayout()
         self.btn_pause = QtWidgets.QPushButton("暂停"); self.btn_pause.setCheckable(True)
@@ -123,7 +127,7 @@ class Monitor14(QtWidgets.QMainWindow):
                 p.setLabel('left', 'EEG', units=self.eeg_unit)
             else:
                 p.setLabel('left', 'ΔHbO2/ΔHbR', units=self.fnirs_unit)
-            p.setXRange(-self.win_s, 0, padding=0)
+            p.setXRange(0, self.win_s, padding=0)
             p.getViewBox().sigRangeChangedManually.connect(self._on_manual_zoom)
             c = p.plot(pen="y")
             gl.addWidget(p, r // ncols, r % ncols); self.plots.append(p); self.curves.append(c)
@@ -155,9 +159,9 @@ class Monitor14(QtWidgets.QMainWindow):
         self.win_s = (5.0, 10.0, 30.0)[i]
         self._reset_x_range()
     def _reset_x_range(self):
-        """14 个子图统一横轴：[-win_s, 0]，0 = 当前时刻。"""
+        """14 个子图统一横轴：0 ~ win_s 秒，0 = 窗口最左（最早），右端 = 最新数据。"""
         for p in self.plots:
-            p.setXRange(-self.win_s, 0, padding=0)
+            p.setXRange(0, self.win_s, padding=0)
     def _set_follow(self, v: bool):
         self._follow = bool(v)
         if self._follow:
@@ -390,7 +394,16 @@ class Monitor14(QtWidgets.QMainWindow):
         return "正常"
 
     def push_frame(self, seq, eeg_uv, hbo, hbr, raw=None, battery=-1.0, acc_xyz=None, gyro_xyz=None,
-                   ts_abs_ms=0, event_type=0, event_ts=0, device_id=1):
+                   ts_abs_ms=0, event_type=0, event_ts=0, device_id=1, eeg_n=None):
+        self._t_rx = time.time()
+        # eeg_n 是"本帧实际带了几路 EEG"。文本链路每行只有 1 个数时传 1,
+        # 其余 3 路是补 0 的占位, 不能当数据画出来。
+        n_ok = self.n_eeg if eeg_n is None else max(0, min(int(eeg_n), self.n_eeg))
+        for i in range(n_ok):
+            self._ch_ok[i] = True
+        if raw is not None:
+            for i in range(10):
+                self._ch_ok[self.n_eeg + i] = True
         if device_id is not None:
             self._device_id = int(device_id)
         if self._seq_last >= 0:
@@ -472,12 +485,18 @@ class Monitor14(QtWidgets.QMainWindow):
         """状态栏：收包数、丢包率、fNIRS 状态、电量；没有数据时显示「等待数据」。"""
         r = self._lost / max(1, self._lost + self._recv)
         bat = f"{self.battery_pct:.0f}%" if self.battery_pct >= 0 else "--%"
+        idle = 0.0 if self._t_rx is None else (time.time() - self._t_rx)
         if self._recv == 0:
             head = "等待数据"
+        elif idle > 2.0:
+            # 停发后不要继续显示旧帧率, 否则看起来像还在采
+            head = f"无新数据 {idle:.0f}s | 累计收包 {self._recv} | 板子已停发"
         else:
             fps_s = f"{self.fs_measured:.1f}Hz" if self.fs_measured else "--Hz"
+            # 文本链路没做过折算, 标 μV 就是假信息
+            unit = "原始值" if getattr(self, "unit_unknown", False) else "μV"
             head = (f"帧率 {fps_s} | 收包 {self._recv} | 丢包率 {r:.1%}"
-                    f" | 量程±{self.eeg_scale:.0f}μV")
+                    f" | 量程±{self.eeg_scale:.0f}{unit}")
         self.lbl.setText(f"{head} | fNIRS {self.fnirs_state()} | 电量 {bat}")
         self._refresh_quality()
 
@@ -519,6 +538,8 @@ class Monitor14(QtWidgets.QMainWindow):
         self.fs_measured = 0.0
         self._fs_snapped = False      # 换源后重新按实测帧率校准
         self.eeg_scale = 100.0
+        self._ch_ok = [False]*self.n_total     # 换源后重新判定哪些通道有数据
+        self._t_rx = None
         self.eeg_quality = ["--"] * self.n_eeg
         self.fnirs_quality = ["--"] * 10
 
@@ -592,42 +613,56 @@ class Monitor14(QtWidgets.QMainWindow):
         # 长度必须夹到缓冲宽度：不相等时绘图库抛异常，PyQt5 会直接 abort 退出
         n = max(32, min(n, self.buf_eeg.shape[1]))
         m = max(16, min(m, self.buf_fn.shape[1]))
+        # 只画真数据：一帧都没收到，或板子已停发超过 2 s，就把曲线清空。
+        # 否则缓冲区里的历史波形会一直留在屏上，看着像板子还在发。
+        stale = self._t_rx is None or (time.time() - self._t_rx) > 2.0
+        if self._recv == 0 or stale:
+            for c in self.curves:
+                c.setData([], [])
+            return
         # 缓冲还没填满时，前面的 0 是补位不是数据。拿它算峰峰值会把量程放大一倍
         # （0 到 -8000 的跳变），之后信号一直被压成平线。只画已收到的样本。
-        if self._recv and self._recv < n:
+        if self._recv < n:
             n = max(2, int(self._recv))
-        if self._recv and self._recv < m:
+        if self._recv < m:
             m = max(2, int(self._recv))
-        if self.eeg_scale_auto and self._recv:
+        if self.eeg_scale_auto:
             self._auto_eeg_scale(self.buf_eeg[:, -n:])
-        # 横轴以 0 = 当前时刻、向左为负，14 个子图共用同一把尺（合同 S1「时间轴统一」）。
-        # 之前用 arange(n)/fs 从 0 起算，n 又随实测帧率变，会出现 EEG 显示 0.3 s、
-        # fNIRS 显示 10 s 的同屏不同轴。
+        # 横轴从 0 向右递增：最左是窗口里最早的一帧，最右是最新一帧，14 个子图共用一把尺
+        # （合同 S1「时间轴统一」）。之前用负值表示"距今多少秒"，读数要反着看，现场容易误判。
         fe = max(self.fs_eeg, 1e-6); ff = max(self.fs_fnirs, 1e-6)
-        te = np.arange(n) / fe - n / fe
-        tf = np.arange(m) / ff - m / ff
+        te = np.arange(n) / fe
+        tf = np.arange(m) / ff
         if self._follow:
             self._reset_x_range()
         for i in range(self.n_eeg):
-            if self.ch_enable[i]:
-                seg = self.buf_eeg[i, -n:]
-                self.curves[i].setData(te, seg)
-                if not self._follow:
-                    continue          # 手动缩放中: 不再抢用户的视野
-                if self.eeg_scale_auto and seg.size:
-                    # 自动档: 窗口跟着信号中心走, 带直流偏置的原始值也能看清细节
-                    mid = float((np.max(seg) + np.min(seg)) / 2.0)
-                    if np.isfinite(mid):
-                        self.plots[i].setYRange(mid - self.eeg_scale, mid + self.eeg_scale)
-                    else:
-                        self.plots[i].setYRange(-self.eeg_scale, self.eeg_scale)
+            # ch_enable 是用户手动勾选，_ch_ok 是"这条链路该通道确实收到过数据"。
+            # 两者都成立才画：文本链路每行只发 1 列时，其余 3 路只是补 0 的占位，
+            # 画出来就是一条贴 0 的假平线，现场会误判成"信号一直是 0"。
+            if not (self.ch_enable[i] and self._ch_ok[i]):
+                self.curves[i].setData([], [])
+                continue
+            seg = self.buf_eeg[i, -n:]
+            self.curves[i].setData(te, seg)
+            if not self._follow:
+                continue          # 手动缩放中: 不再抢用户的视野
+            if self.eeg_scale_auto and seg.size:
+                # 自动档: 窗口跟着信号中心走, 带直流偏置的原始值也能看清细节
+                mid = float((np.max(seg) + np.min(seg)) / 2.0)
+                if np.isfinite(mid):
+                    self.plots[i].setYRange(mid - self.eeg_scale, mid + self.eeg_scale)
                 else:
-                    # 手动档: 保持 ±量程 的绝对语义(μV 标尺), 不跟随信号漂移
                     self.plots[i].setYRange(-self.eeg_scale, self.eeg_scale)
+            else:
+                # 手动档: 保持 ±量程 的绝对语义, 不跟随信号漂移
+                self.plots[i].setYRange(-self.eeg_scale, self.eeg_scale)
         for i in range(10):
-            if self.ch_enable[self.n_eeg+i]:
-                self.curves[self.n_eeg+i].setData(tf, self.buf_fn[i, -m:])
-                self.plots[self.n_eeg+i].setYRange(-self.fnirs_scale, self.fnirs_scale)
+            k = self.n_eeg + i
+            if not (self.ch_enable[k] and self._ch_ok[k]):
+                self.curves[k].setData([], [])
+                continue
+            self.curves[k].setData(tf, self.buf_fn[i, -m:])
+            self.plots[k].setYRange(-self.fnirs_scale, self.fnirs_scale)
 
 def main():
     app = QtWidgets.QApplication(sys.argv)
