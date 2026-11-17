@@ -41,6 +41,12 @@ class Monitor14(QtWidgets.QMainWindow):
         self.n_mbll_singular = 0       # 矩阵奇异被置 NaN 的次数(现场坏道计数)
         self.extra_cols = False  # 是否写 S8 姿态/S9 指标扩展列(默认不写)
         self.eeg_scale = 100.0; self.fnirs_scale = 0.5
+        # 轴单位: 二进制链路是折算后的 μV / mM; 文本链路的单位还没确认, 只能标"原始值"
+        self.eeg_unit = "μV"
+        self.fnirs_unit = "mM"
+        # 自动改范围(时间轴滚动+量程)的开关。用户一旦手动缩放就关掉,
+        # 否则每 40ms 被 setXRange/setYRange 抢回去, "支持缩放"等于没有。
+        self._follow = True
         self.ch_enable = [True]*self.n_total
         cw = QtWidgets.QWidget(); self.setCentralWidget(cw); lay = QtWidgets.QVBoxLayout(cw)
         bar = QtWidgets.QHBoxLayout()
@@ -50,7 +56,7 @@ class Monitor14(QtWidgets.QMainWindow):
         self.cmb_fnirs.currentIndexChanged.connect(lambda i: setattr(self, "show_hbo", i == 0))
         self.cmb_win = QtWidgets.QComboBox(); self.cmb_win.addItems(["5s", "10s", "30s"])
         self.cmb_win.setCurrentIndex(1)
-        self.cmb_win.currentIndexChanged.connect(lambda i: setattr(self, "win_s", (5, 10, 30)[i]))
+        self.cmb_win.currentIndexChanged.connect(self._set_win)
         # 默认自动量程：真机增益未知时固定量程会把波形画到框外
         self.eeg_scale_auto = True
         self.cmb_scale = QtWidgets.QComboBox()
@@ -65,6 +71,11 @@ class Monitor14(QtWidgets.QMainWindow):
         self.cmb_fscale.setCurrentIndex(1)
         self.cmb_fscale.currentIndexChanged.connect(
             lambda i: setattr(self, "fnirs_scale", (0.2, 0.5, 1.0, 2.0)[i]))
+        # 缩放后必须能停在当前视野: 否则 40ms 一次的重绘会把手动缩放抢回去
+        self.btn_follow = QtWidgets.QPushButton("跟随最新")
+        self.btn_follow.setCheckable(True); self.btn_follow.setChecked(True)
+        self.btn_follow.setToolTip("取消勾选后不再自动改时间轴与量程，方便放大看细节")
+        self.btn_follow.toggled.connect(self._set_follow)
         self.lbl = QtWidgets.QLabel("丢包率 0.0% | 电量 --% | seq连续 OK")
         # S3: 各通道信号质量的实时显示(此前只在内存里算, 从没画到界面上)
         self.lbl_quality = QtWidgets.QLabel("通道质量 --")
@@ -72,7 +83,7 @@ class Monitor14(QtWidgets.QMainWindow):
         self.btn_verify = QtWidgets.QPushButton("离线自检")
         self.btn_verify.clicked.connect(self._open_verify)
         for w in (self.btn_pause, self.cmb_fnirs, self.cmb_win, self.cmb_scale,
-                  self.cmb_fscale, self.btn_verify, self.lbl):
+                  self.cmb_fscale, self.btn_follow, self.btn_verify, self.lbl):
             bar.addWidget(w)
         lay.addLayout(bar)
         qrow = QtWidgets.QHBoxLayout()
@@ -106,6 +117,14 @@ class Monitor14(QtWidgets.QMainWindow):
         for r, n in enumerate(names):
             p = pg.PlotWidget(title=n); p.showGrid(x=True, y=True)
             p.setMouseEnabled(x=True, y=True)  # 缩放
+            # 合同 S1 要求「时间轴统一」: 横轴必须是同一个绝对量(秒), 不能各图各的
+            p.setLabel('bottom', '时间', units='s')
+            if r < self.n_eeg:
+                p.setLabel('left', 'EEG', units=self.eeg_unit)
+            else:
+                p.setLabel('left', 'ΔHbO2/ΔHbR', units=self.fnirs_unit)
+            p.setXRange(-self.win_s, 0, padding=0)
+            p.getViewBox().sigRangeChangedManually.connect(self._on_manual_zoom)
             c = p.plot(pen="y")
             gl.addWidget(p, r // ncols, r % ncols); self.plots.append(p); self.curves.append(c)
         self.t0 = time.time()
@@ -130,6 +149,32 @@ class Monitor14(QtWidgets.QMainWindow):
         self.eeg_scale_auto = (i == 0)
         if not self.eeg_scale_auto:
             self.eeg_scale = (100.0, 200.0, 500.0)[max(0, min(i - 1, 2))]
+    # ---- 时间轴 / 跟随 ----
+    def _set_win(self, i: int):
+        """时间窗切换后立刻重设横轴，不然要等下一次重绘才对齐。"""
+        self.win_s = (5.0, 10.0, 30.0)[i]
+        self._reset_x_range()
+    def _reset_x_range(self):
+        """14 个子图统一横轴：[-win_s, 0]，0 = 当前时刻。"""
+        for p in self.plots:
+            p.setXRange(-self.win_s, 0, padding=0)
+    def _set_follow(self, v: bool):
+        self._follow = bool(v)
+        if self._follow:
+            self._reset_x_range()
+    def _on_manual_zoom(self, *_):
+        """用户拖过/滚过就停止自动改范围，否则每 40ms 被抢回，缩放等于没有。"""
+        if self._follow:
+            self._follow = False
+            self.btn_follow.setChecked(False)
+            self.lbl.setText("已手动缩放：不再自动跟随，点「跟随最新」恢复")
+    def _apply_axis_labels(self):
+        """单位随链路变：二进制是折算后的 μV，文本是未换算的原始值。"""
+        for i, p in enumerate(self.plots):
+            if i < self.n_eeg:
+                p.setLabel('left', 'EEG', units=self.eeg_unit)
+            else:
+                p.setLabel('left', 'ΔHbO2/ΔHbR', units=self.fnirs_unit)
     def _auto_eeg_scale(self, seg):
         """按实测峰峰值定半幅量程，只改显示范围，不改数据本身。
 
@@ -492,9 +537,23 @@ class Monitor14(QtWidgets.QMainWindow):
         # 直接喂指标算法会把 brain_relax 算成常数并触发 exp 溢出。这里整段不参与，
         # 指标保持默认值，比显示一个错的数好。
         self.unit_unknown = getattr(receiver, "kind", "") in ("text", "text-file")
+        # 轴单位跟着链路走: 文本链路没折算过, 标 μV 就是假信息
+        self.eeg_unit = "原始值·单位待定" if self.unit_unknown else "μV"
+        self._apply_axis_labels()
 
     def _update_rate(self):
-        """用实测帧率校正显示采样率。"""
+        """用实测帧率校正显示采样率。
+
+        两点必须排除，否则时间轴直接错：
+        1) 文件回放是"瞬间读完一个文件"，实测出来的 fps 是回放速度，不是采样率。
+           拿它当 fs，500 SPS 的波形会被按 8000 SPS 画，横向压成一小段。
+        2) 样本太少时首末时间差太小，fps 抖动极大。攒够帧数再校准。
+        """
+        kind = getattr(self._receiver, "kind", "")
+        if kind in ("text-file", "dry"):
+            return
+        if self._recv < 50:
+            return
         try:
             fs = float(self._receiver.measured_fps())
         except Exception:
@@ -537,13 +596,24 @@ class Monitor14(QtWidgets.QMainWindow):
         # （0 到 -8000 的跳变），之后信号一直被压成平线。只画已收到的样本。
         if self._recv and self._recv < n:
             n = max(2, int(self._recv))
+        if self._recv and self._recv < m:
+            m = max(2, int(self._recv))
         if self.eeg_scale_auto and self._recv:
             self._auto_eeg_scale(self.buf_eeg[:, -n:])
-        te = np.arange(n)/max(self.fs_eeg, 1e-6); tf = np.arange(m)/max(self.fs_fnirs, 1e-6)
+        # 横轴以 0 = 当前时刻、向左为负，14 个子图共用同一把尺（合同 S1「时间轴统一」）。
+        # 之前用 arange(n)/fs 从 0 起算，n 又随实测帧率变，会出现 EEG 显示 0.3 s、
+        # fNIRS 显示 10 s 的同屏不同轴。
+        fe = max(self.fs_eeg, 1e-6); ff = max(self.fs_fnirs, 1e-6)
+        te = np.arange(n) / fe - n / fe
+        tf = np.arange(m) / ff - m / ff
+        if self._follow:
+            self._reset_x_range()
         for i in range(self.n_eeg):
             if self.ch_enable[i]:
                 seg = self.buf_eeg[i, -n:]
                 self.curves[i].setData(te, seg)
+                if not self._follow:
+                    continue          # 手动缩放中: 不再抢用户的视野
                 if self.eeg_scale_auto and seg.size:
                     # 自动档: 窗口跟着信号中心走, 带直流偏置的原始值也能看清细节
                     mid = float((np.max(seg) + np.min(seg)) / 2.0)
