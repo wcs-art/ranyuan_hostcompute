@@ -180,7 +180,10 @@ class Monitor14(QtWidgets.QMainWindow):
         self._stack.addWidget(self._grid_page)
         for r, n in enumerate(names):
             p = pg.PlotWidget(title=n); p.showGrid(x=True, y=True)
-            p.setMouseEnabled(x=True, y=True)  # 缩放
+            # 只让鼠标改横轴：纵轴永远由程序按可见数据贴合（自动档）或按标尺固定档。
+            # 之前 x/y 都开放，滚轮一下就把 Y 也缩了/拖了，数据跑出窗口后屏幕上什么都没有，
+            # 现场以为是"放大以后数据消失了"。横轴缩放才是这里真正需要的操作。
+            p.setMouseEnabled(x=True, y=False)
             # 合同 S1 要求「时间轴统一」: 横轴必须是同一个绝对量(秒), 不能各图各的
             p.setLabel('bottom', '时间', units='s')
             self._set_left_label(p, r)
@@ -188,7 +191,6 @@ class Monitor14(QtWidgets.QMainWindow):
             # 会叠成一团黑糊，现场反而以为"纵轴坏了、数值变了"。
             # 这里只保留刻度线和网格，数值到「单通道放大」里看，那里空间够、写的是原值。
             p.getAxis('left').setStyle(showValues=False)
-            p.getAxis('bottom').setStyle(showValues=(r >= self.n_total - ncols))
             p.setXRange(0, self.win_s, padding=0)
             # 带上序号: 之后要按"用户缩的是哪一张"取数据并统一到 14 张图
             p.getViewBox().sigRangeChangedManually.connect(
@@ -214,7 +216,7 @@ class Monitor14(QtWidgets.QMainWindow):
         head.addWidget(self._lbl_solo, 1); head.addWidget(self._btn_back)
         sl.addLayout(head)
         self._big = pg.PlotWidget(); self._big.showGrid(x=True, y=True)
-        self._big.setMouseEnabled(x=True, y=True)
+        self._big.setMouseEnabled(x=True, y=False)   # 纵轴恒由数据贴合，见网格页注释
         self._big.setLabel('bottom', '时间', units='s')
         self._big.setXRange(0, self.win_s, padding=0)
         self._big.getViewBox().sigRangeChangedManually.connect(
@@ -990,13 +992,24 @@ class Monitor14(QtWidgets.QMainWindow):
                 return
             tip.hide()
             curve.setData(x, y)
-            if not self._follow:
-                # 手动缩放中: 不改量程（否则每 40ms 被抢回去），但如果这一段数据
-                # 整段跑出了 Y 窗口，曲线会凭空消失、看着像"数据没了"，这里拉回来。
-                self._ensure_y_visible(plot, y)
-                return                     # 手动缩放中: 不再抢用户的视野
+            # 纵轴一律按"屏幕上这段数据"定：Y 轴已不接受鼠标缩放（setMouseEnabled(y=False)），
+            # 所以不存在抢用户视野的问题。旧做法是手动缩放后冻结 Y，结果拖到直流漂移的
+            # 另一段时曲线整段画在框外，屏幕上什么都没有 —— 现场当成"数据没了"。
+            self._fit_y(plot, i, y)
+            return
+        if not (self.ch_enable[i] and self._ch_ok[i]):
+            curve.setData([], [])
+            tip.setText("无数据（本链路未发送该通道）"); tip.show()
+            plot.setYRange(-0.01, 0.01, padding=0)
+            return
+        tip.hide()
+        curve.setData(x, y)
+        self._fit_y(plot, i, y)
+
+    def _fit_y(self, plot, i: int, y):
+        """按这一路可见数据的鲁棒中心/半幅设 Y 范围（与横轴是否手动缩放无关）。"""
+        if i < self.n_eeg:
             if self.eeg_scale_auto and y.size:
-                # 自动档: 窗口跟着信号中心走, 带直流偏置的原始值也能看清细节
                 rs = self._robust_span(y)
                 mid = rs[0] if rs is not None else float(np.median(y))
                 if np.isfinite(mid):
@@ -1007,44 +1020,9 @@ class Monitor14(QtWidgets.QMainWindow):
             else:
                 # 手动档: 保持 ±量程 的绝对语义, 不跟随信号漂移
                 plot.setYRange(-self.eeg_scale, self.eeg_scale, padding=0)
-            return
-        if not (self.ch_enable[i] and self._ch_ok[i]):
-            curve.setData([], [])
-            tip.setText("无数据（本链路未发送该通道）"); tip.show()
-            plot.setYRange(-0.01, 0.01, padding=0)
-            return
-        tip.hide()
-        curve.setData(x, y)
-        if self._follow:
-            plot.setYRange(-self.fnirs_scale, self.fnirs_scale, padding=0)
         else:
-            self._ensure_y_visible(plot, y, self.fnirs_scale)
+            plot.setYRange(-self.fnirs_scale, self.fnirs_scale, padding=0)
 
-    def _ensure_y_visible(self, plot, y, half=None):
-        """手动缩放状态下，只在曲线整段跑出视野时把 Y 拉回来。
-
-        拖/缩横轴看历史时，那一段的直流偏置可能和当前 Y 窗口差几千（原始值会漂），
-        曲线就整段画在框外，屏幕上什么都没有，现场会当成"数据丢了"。
-        只在交集不足 15% 时才动 —— 用户刻意放大某个电平时，视野里还有数据，不抢。
-        """
-        try:
-            ylo, yhi = plot.getViewBox().viewRange()[1]
-            dlo, dhi = float(np.min(y)), float(np.max(y))
-        except Exception:  # noqa: BLE001
-            return
-        if not (np.isfinite(ylo) and np.isfinite(yhi)
-                and np.isfinite(dlo) and np.isfinite(dhi)):
-            return
-        span = yhi - ylo; dspan = dhi - dlo
-        if span <= 0 or dspan < 0:
-            return
-        inside = min(yhi, dhi) - max(ylo, dlo)
-        if inside > 0.15 * max(min(span, dspan), 1e-12):
-            return
-        rs = self._robust_span(y)
-        mid = rs[0] if rs is not None else (dlo + dhi) / 2.0
-        want = max(float(half if half is not None else self.eeg_scale), dspan / 2.0 * 1.05)
-        plot.setYRange(mid - want, mid + want, padding=0)
 
 def main():
     app = QtWidgets.QApplication(sys.argv)

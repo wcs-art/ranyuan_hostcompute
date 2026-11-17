@@ -443,3 +443,39 @@ def test_curve_stays_in_view_when_x_zoomed(mon):
     y = mon.curves[0].getData()[1]
     assert float(min(y)) > lo and float(max(y)) < hi, \
         f"曲线跑到窗口外: 数据 {min(y):.0f}~{max(y):.0f}, 视野 {lo:.0f}~{hi:.0f}"
+
+
+def test_y_axis_cannot_be_mouse_zoomed(mon):
+    """纵轴不许被滚轮/拖拽改：那是"放大以后数据消失"的根源。
+
+    x、y 都开时，滚轮一下把 Y 也缩了；数据一旦落在窗口外，屏幕上什么都没有，
+    现场当成"数据没了"。这里锁死 Y，只让鼠标改时间轴。
+    """
+    assert mon.plots[0].getViewBox().state['mouseEnabled'] == [True, False]
+    assert mon._big.getViewBox().state['mouseEnabled'] == [True, False]
+
+
+def test_bottom_time_axis_is_shown_on_every_plot(mon):
+    """时间刻度不能只挂在最后一行 —— 现场会看成"时间被单独放进了一个格子"。"""
+    for i, p in enumerate(mon.plots):
+        assert p.getAxis('bottom').style['showValues'] is True, f"第 {i} 张图没有时间刻度"
+
+
+def test_zoom_keeps_data_inside_y_window_in_solo(mon, app):
+    """放大页里缩到直流漂移的另一段，曲线也必须留在视野内。"""
+    mon.fs_eeg = mon.fs_fnirs = 100.0
+    _push(mon, [-104300.0 + (i % 7) for i in range(1000)] +
+              [-101300.0 + (i % 7) for i in range(1000)])
+    mon.resize(1200, 700); mon.show()
+    mon._solo_plot(0)
+    app.processEvents()
+    for lo, hi in ((0.0, 20.0), (10.0, 20.0), (2.0, 4.0), (11.0, 13.0)):
+        mon._big.setXRange(lo, hi, padding=0)
+        mon._on_manual_zoom(-1)
+        mon._tick(force=True)
+        app.processEvents()
+        y = mon._big_curve.getData()[1]
+        yv = mon._big.getViewBox().viewRange()[1]
+        assert len(y) > 0, f"缩到 {lo}~{hi}s 后没有数据"
+        assert float(min(y)) > yv[0] and float(max(y)) < yv[1], \
+            f"缩到 {lo}~{hi}s 后曲线跑出窗口: 数据 {min(y):.0f}~{max(y):.0f}, 视野 {yv[0]:.0f}~{yv[1]:.0f}"
