@@ -1,7 +1,7 @@
 """14 通道实时波形：4 路 EEG + 10 通道 fNIRS，统一时间轴，可缩放、暂停、记录导出。"""
 from __future__ import annotations
 import sys, time, math, numpy as np
-from PyQt5 import QtWidgets, QtCore
+from PyQt5 import QtWidgets, QtCore, QtGui
 import pyqtgraph as pg
 
 import contract   # _rec_row 依赖它; 缺失时 NameError 会被 _tick 的 except 吞掉,
@@ -138,24 +138,31 @@ class Monitor14(QtWidgets.QMainWindow):
         self.ch_scroll = scroll  # S1: 主界面嵌入时隐藏内嵌通道条, 只留外部通道开关
         self.plots = []; self.curves = []
         self._tips = []          # 空子图上的灰字提示(等待数据/本链路未发送该通道)
-        gl = QtWidgets.QGridLayout(); lay.addLayout(gl)
         names = ch_labels
         ncols = 2 if self.n_total <= 16 else 4
-        self._gl = gl; self._names = names; self._ncols = ncols
+        self._names = names; self._ncols = ncols
         self._nrows = (len(names) + ncols - 1) // ncols
-        #: 单通道放大时独占全屏的是哪一路；None = 14 图并排
+        #: 单通道放大看的是哪一路；None = 14 图并排
         self._solo = None
         #: 最近一次点到的子图，供工具栏按钮"放大当前"用
         self._focus_idx = 0
+        # 14 图放在"网格页"，单通道放大放在"大图页"，用 QStackedWidget 切。
+        # 前一次实现是在同一个 QGridLayout 里把子图 addWidget 跨满格子来放大：
+        # 放大能成，但还原时格子已被重排，14 图的高度分布回不到原样
+        # （实测单张可绘区 5.1px -> 还原后 64.1px），而且重排过程中量程/跟随状态
+        # 会互相打架。分页之后网格永不改动，放大缩小是可逆的。
+        self._stack = QtWidgets.QStackedWidget()
+        lay.addWidget(self._stack, 1)
+        self._grid_page = QtWidgets.QWidget()
+        gl = QtWidgets.QGridLayout(self._grid_page); gl.setContentsMargins(0, 0, 0, 0)
+        self._gl = gl
+        self._stack.addWidget(self._grid_page)
         for r, n in enumerate(names):
             p = pg.PlotWidget(title=n); p.showGrid(x=True, y=True)
             p.setMouseEnabled(x=True, y=True)  # 缩放
             # 合同 S1 要求「时间轴统一」: 横轴必须是同一个绝对量(秒), 不能各图各的
             p.setLabel('bottom', '时间', units='s')
-            if r < self.n_eeg:
-                p.setLabel('left', 'EEG', units=self.eeg_unit)
-            else:
-                p.setLabel('left', 'ΔHbO2/ΔHbR', units=self.fnirs_unit)
+            self._set_left_label(p, r)
             p.setXRange(0, self.win_s, padding=0)
             p.getViewBox().sigRangeChangedManually.connect(self._on_manual_zoom)
             c = p.plot(pen="y")
@@ -166,11 +173,40 @@ class Monitor14(QtWidgets.QMainWindow):
             # 14 图并排时每张只有几十像素高，起伏看不出来。双击任何一张 -> 单独放大
             p.scene().sigMouseClicked.connect(lambda ev, k=r: self._on_plot_click(ev, k))
             gl.addWidget(p, r // ncols, r % ncols); self.plots.append(p); self.curves.append(c)
+
+        # ---- 单通道大图页 ----
+        # 独立的一张 PlotWidget, 不搬动网格里的子图: 放大/缩小只是切页, 几何状态零副作用
+        self._solo_page = QtWidgets.QWidget()
+        sl = QtWidgets.QVBoxLayout(self._solo_page); sl.setContentsMargins(0, 0, 0, 0)
+        head = QtWidgets.QHBoxLayout()
+        self._lbl_solo = QtWidgets.QLabel("单通道放大")
+        self._lbl_solo.setStyleSheet("font-weight:bold")
+        self._btn_back = QtWidgets.QPushButton("← 返回 14 图")
+        self._btn_back.clicked.connect(self._restore_grid)
+        head.addWidget(self._lbl_solo, 1); head.addWidget(self._btn_back)
+        sl.addLayout(head)
+        self._big = pg.PlotWidget(); self._big.showGrid(x=True, y=True)
+        self._big.setMouseEnabled(x=True, y=True)
+        self._big.setLabel('bottom', '时间', units='s')
+        self._big.setXRange(0, self.win_s, padding=0)
+        self._big.getViewBox().sigRangeChangedManually.connect(self._on_manual_zoom)
+        big_font = QtGui.QFont(); big_font.setPointSize(10)
+        for ax in ('bottom', 'left'):
+            self._big.getAxis(ax).setStyle(tickFont=big_font)
+        self._big_curve = self._big.plot(pen="y")
+        self._big_tip = pg.TextItem("等待数据…", color="#909090", anchor=(0.5, 0.5))
+        self._big_tip.setPos(self.win_s / 2.0, 0.0); self._big_tip.hide()
+        self._big.addItem(self._big_tip)
+        self._big.scene().sigMouseClicked.connect(
+            lambda ev: self._on_plot_click(ev, 0 if self._solo is None else self._solo))
+        sl.addWidget(self._big, 1)
+        self._stack.addWidget(self._solo_page)
+        self._stack.setCurrentWidget(self._grid_page)
+
         # 键盘 Esc 还原（现场全屏看细节后不用去找鼠标）。
         # 主界面是把本窗口的 centralWidget 嵌进去用的，这里不能用 WindowShortcut
         # —— 那个"窗口"从来没显示过，快捷键永远不触发。
         try:
-            from PyQt5 import QtGui
             sc = QtWidgets.QShortcut(QtGui.QKeySequence("Esc"), self)
             sc.setContext(QtCore.Qt.WidgetWithChildrenShortcut)
             sc.activated.connect(self._restore_grid)
@@ -193,20 +229,27 @@ class Monitor14(QtWidgets.QMainWindow):
         self._metrics = {"brain_active": 50.0, "brain_relax": 50.0, "focus": 50.0, "hr_bpm": 0.0}
     def _toggle_ch(self, k: int, v: bool):
         self.ch_enable[k] = v
-        # 单通道放大时只让那一路可见，勾选框不要把它整体打开
-        self.plots[k].setVisible(v and (self._solo in (None, k)))
-    # ---- 单通道放大 ----
+        self.plots[k].setVisible(v)
+    # ---- 单通道放大 / 还原 ----
     def _title_of(self, i: int) -> str:
         return self._names[i] if i < len(self._names) else f"CH{i+1}"
 
+    def _set_left_label(self, plot, i: int):
+        """纵轴单位跟着通道与链路走：fNIRS 是 mM，文本链路的 EEG 是"单位待定"。"""
+        if i < self.n_eeg:
+            plot.setLabel('left', 'EEG', units=self.eeg_unit)
+        else:
+            plot.setLabel('left', 'ΔHbO2/ΔHbR', units=self.fnirs_unit)
+
     def _on_plot_click(self, ev, i: int):
-        """点一下就记住"当前是哪一路"，双击则放大/还原。"""
+        """点一下记住"当前是哪一路"，双击则放大/还原。"""
         self._focus_idx = i
-        if ev.double():
-            if self._solo == i:
-                self._restore_grid()
-            else:
-                self._solo_plot(i)
+        if not ev.double():
+            return
+        if self._solo == i:
+            self._restore_grid()
+        else:
+            self._solo_plot(i)
 
     def _toggle_solo(self):
         if self._solo is None:
@@ -215,29 +258,32 @@ class Monitor14(QtWidgets.QMainWindow):
             self._restore_grid()
 
     def _solo_plot(self, i: int):
-        """把第 i 路铺满整个绘图区：14 图并排时每张才几十像素高，起伏看不出来。"""
+        """放大第 i 路：切成大图页，并只按这一路重新算量程。"""
         if not (0 <= i < len(self.plots)):
             return
         self._solo = i
-        for j, p in enumerate(self.plots):
-            p.setVisible(j == i)
-        # 重新 addWidget 到整块格子里，才会真正占满（仅仅隐藏其它图只会留出空格）
-        self._gl.addWidget(self.plots[i], 0, 0, self._nrows, self._ncols)
-        self.plots[i].setTitle(f"{self._title_of(i)}　单通道放大（双击或 Esc 还原）")
-        self.btn_solo.setText("⤢ 还原 14 图")
+        self._lbl_solo.setText(f"{self._title_of(i)}　单通道放大（双击波形 / 按 Esc / 点右上角返回）")
+        self._set_left_label(self._big, i)
+        self._big.setTitle("")
+        self._stack.setCurrentWidget(self._solo_page)
+        self.btn_solo.setText("⤢ 返回 14 图")
+        # 放大就是要看细节：恢复自动跟随，别继承之前拖拽留下的冻结状态
+        self._follow = True
+        self.btn_follow.setChecked(True)
         self._reset_x_range()
+        self._tick(force=True)            # 立刻重画，不要等下一个 40ms 节拍
 
     def _restore_grid(self):
-        """还原成 14 图并排（按通道开关决定各自是否可见）。"""
-        if self._solo is None and self.btn_solo.text().startswith("⤢ 还原"):
+        """回到 14 图并排。网格从未被改动过，切页即可回到原样。"""
+        if self._solo is None:
             return
         self._solo = None
-        for r, p in enumerate(self.plots):
-            self._gl.addWidget(p, r // self._ncols, r % self._ncols)
-            p.setTitle(self._title_of(r))
-            p.setVisible(self.ch_enable[r])
+        self._stack.setCurrentWidget(self._grid_page)
         self.btn_solo.setText("⤢ 单通道放大")
+        self._follow = True
+        self.btn_follow.setChecked(True)
         self._reset_x_range()
+        self._tick(force=True)
     def _set_eeg_scale(self, i: int):
         """幅度标尺: 0=自动, 1~3=固定 ±100/±200/±500μV。"""
         self.eeg_scale_auto = (i == 0)
@@ -249,11 +295,14 @@ class Monitor14(QtWidgets.QMainWindow):
         self.win_s = (5.0, 10.0, 30.0)[i]
         self._reset_x_range()
     def _reset_x_range(self):
-        """14 个子图统一横轴：0 ~ win_s 秒，0 = 窗口最左（最早），右端 = 最新数据。"""
+        """所有图（含大图）统一横轴：0 ~ win_s 秒，0 = 窗口最左，右端 = 最新数据。"""
         for i, p in enumerate(self.plots):
             p.setXRange(0, self.win_s, padding=0)
             if i < len(self._tips):
                 self._tips[i].setPos(self.win_s / 2.0, 0.0)
+        if hasattr(self, "_big"):
+            self._big.setXRange(0, self.win_s, padding=0)
+            self._big_tip.setPos(self.win_s / 2.0, 0.0)
     def _set_follow(self, v: bool):
         self._follow = bool(v)
         if self._follow:
@@ -267,10 +316,9 @@ class Monitor14(QtWidgets.QMainWindow):
     def _apply_axis_labels(self):
         """单位随链路变：二进制是折算后的 μV，文本是未换算的原始值。"""
         for i, p in enumerate(self.plots):
-            if i < self.n_eeg:
-                p.setLabel('left', 'EEG', units=self.eeg_unit)
-            else:
-                p.setLabel('left', 'ΔHbO2/ΔHbR', units=self.fnirs_unit)
+            self._set_left_label(p, i)
+        if self._solo is not None:
+            self._set_left_label(self._big, self._solo)
     @staticmethod
     def _robust_span(row):
         """一段样本 -> (中心, 半幅)，用分位数定量程，单个毛刺不参与。
@@ -699,8 +747,9 @@ class Monitor14(QtWidgets.QMainWindow):
             self.fs_eeg = self.fs_eeg * 0.9 + fs * 0.1
             self.fs_fnirs = self.fs_eeg
 
-    def _tick(self):
-        if self.paused: return
+    def _tick(self, force: bool = False):
+        # force=True: 放大/还原这种用户动作要立刻重画，不能被"暂停"挡住
+        if self.paused and not force: return
         # 唯一数据入口: _receiver。没有 receiver 就不产生任何数据(不造数)。
         if self._receiver is not None:
             # 实机/录播: 每节拍取帧并push, 解析(帧头/seq/μV折算/事件)在receivers+device_frame里做
@@ -731,6 +780,8 @@ class Monitor14(QtWidgets.QMainWindow):
                 c.setData([], [])
             for tip in self._tips:
                 tip.setText("等待数据…"); tip.show()
+            self._big_curve.setData([], [])
+            self._big_tip.setText("等待数据…"); self._big_tip.show()
             return
         # 缓冲还没填满时，前面的 0 是补位不是数据。拿它算峰峰值会把量程放大一倍
         # （0 到 -8000 的跳变），之后信号一直被压成平线。只画已收到的样本。
@@ -739,7 +790,12 @@ class Monitor14(QtWidgets.QMainWindow):
         if self._recv < m:
             m = max(2, int(self._recv))
         if self.eeg_scale_auto:
-            self._auto_eeg_scale(self.buf_eeg[:, -n:])
+            # 单通道放大时只按这一路定量程：放大就是要看这一路自己的细节，
+            # 拿 14 路里最大的那一路定档，小信号会被压成一条线（这正是上一版的问题）。
+            if self._solo is not None and self._solo < self.n_eeg:
+                self._auto_eeg_scale(self.buf_eeg[self._solo:self._solo + 1, -n:])
+            else:
+                self._auto_eeg_scale(self.buf_eeg[:, -n:])
         # 横轴从 0 向右递增：最左是窗口里最早的一帧，最右是最新一帧，14 个子图共用一把尺
         # （合同 S1「时间轴统一」）。之前用负值表示"距今多少秒"，读数要反着看，现场容易误判。
         fe = max(self.fs_eeg, 1e-6); ff = max(self.fs_fnirs, 1e-6)
@@ -747,46 +803,59 @@ class Monitor14(QtWidgets.QMainWindow):
         tf = np.arange(m) / ff
         if self._follow:
             self._reset_x_range()
-        for i in range(self.n_eeg):
-            # ch_enable 是用户手动勾选，_ch_ok 是"这条链路该通道确实收到过数据"。
-            # 两者都成立才画：文本链路每行只发 1 列时，其余 3 路只是补 0 的占位，
-            # 画出来就是一条贴 0 的假平线，现场会误判成"信号一直是 0"。
+        # 网格页的 14 张图
+        for i in range(self.n_total):
+            x, cnt = (te, n) if i < self.n_eeg else (tf, m)
+            self._paint(self.plots[i], self.curves[i], self._tips[i], i, x, cnt)
+        # 大图页：同一份数据再画一次，量程只按这一路算
+        if self._solo is not None:
+            i = self._solo
+            x, cnt = (te, n) if i < self.n_eeg else (tf, m)
+            self._paint(self._big, self._big_curve, self._big_tip, i, x, cnt)
+
+    def _paint(self, plot, curve, tip, i: int, x, cnt: int):
+        """把第 i 路画到指定的图上；14 图小图与单通道大图共用这一份逻辑。
+
+        两条规则不变：
+        1) ch_enable 是用户手动勾选，_ch_ok 是"这条链路确实收到过该通道"，
+           两者都成立才画 —— 文本链路每行只发 1 列时，其余 3 路是补 0 占位，
+           画出来就是一条贴 0 的假平线，现场会误判成"信号一直是 0"。
+        2) 自动量程走分位数，单个毛刺不参与，否则一个坏帧就把整屏压平。
+        """
+        if i < self.n_eeg:
             if not (self.ch_enable[i] and self._ch_ok[i]):
-                self.curves[i].setData([], [])
-                self._tips[i].setText("无数据（本链路未发送该通道）")
-                self._tips[i].show()
-                self.plots[i].setYRange(-1.0, 1.0)
-                continue
-            self._tips[i].hide()
-            seg = self.buf_eeg[i, -n:]
-            self.curves[i].setData(te, seg)
+                curve.setData([], [])
+                tip.setText("无数据（本链路未发送该通道）"); tip.show()
+                plot.setYRange(-1.0, 1.0, padding=0)
+                return
+            tip.hide()
+            seg = self.buf_eeg[i, -cnt:]
+            curve.setData(x, seg)
             if not self._follow:
-                continue          # 手动缩放中: 不再抢用户的视野
+                return                     # 手动缩放中: 不再抢用户的视野
             if self.eeg_scale_auto and seg.size:
-                # 自动档: 窗口跟着信号中心走, 带直流偏置的原始值也能看清细节。
-                # 中心与量程都走分位数, 单个毛刺不会把整屏压平。
+                # 自动档: 窗口跟着信号中心走, 带直流偏置的原始值也能看清细节
                 rs = self._robust_span(seg)
                 mid = rs[0] if rs is not None else float(np.median(seg))
                 if np.isfinite(mid):
                     # padding=0: pyqtgraph 默认再给 2% 边距，叠上自己的余量就更扁了
-                    self.plots[i].setYRange(mid - self.eeg_scale, mid + self.eeg_scale,
-                                            padding=0)
+                    plot.setYRange(mid - self.eeg_scale, mid + self.eeg_scale, padding=0)
                 else:
-                    self.plots[i].setYRange(-self.eeg_scale, self.eeg_scale, padding=0)
+                    plot.setYRange(-self.eeg_scale, self.eeg_scale, padding=0)
             else:
                 # 手动档: 保持 ±量程 的绝对语义, 不跟随信号漂移
-                self.plots[i].setYRange(-self.eeg_scale, self.eeg_scale, padding=0)
-        for i in range(10):
-            k = self.n_eeg + i
-            if not (self.ch_enable[k] and self._ch_ok[k]):
-                self.curves[k].setData([], [])
-                self._tips[k].setText("无数据（本链路未发送该通道）")
-                self._tips[k].show()
-                self.plots[k].setYRange(-0.01, 0.01, padding=0)
-                continue
-            self._tips[k].hide()
-            self.curves[k].setData(tf, self.buf_fn[i, -m:])
-            self.plots[k].setYRange(-self.fnirs_scale, self.fnirs_scale, padding=0)
+                plot.setYRange(-self.eeg_scale, self.eeg_scale, padding=0)
+            return
+        j = i - self.n_eeg
+        if not (self.ch_enable[i] and self._ch_ok[i]):
+            curve.setData([], [])
+            tip.setText("无数据（本链路未发送该通道）"); tip.show()
+            plot.setYRange(-0.01, 0.01, padding=0)
+            return
+        tip.hide()
+        curve.setData(x, self.buf_fn[j, -cnt:])
+        if self._follow:
+            plot.setYRange(-self.fnirs_scale, self.fnirs_scale, padding=0)
 
 def main():
     app = QtWidgets.QApplication(sys.argv)

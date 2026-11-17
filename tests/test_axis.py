@@ -209,35 +209,51 @@ def test_waiting_hint_before_any_frame(mon):
 
 
 # ---- 单通道放大 / 纵轴贴合 ---------------------------------------------------
-def _vb_height(mon, i=0):
-    return mon.plots[i].getViewBox().sceneBoundingRect().height()
+def _vb_height(plot):
+    return plot.getViewBox().sceneBoundingRect().height()
 
 
-def test_solo_plot_fills_the_grid(mon, app):
-    """14 图并排时每张只有几像素高，双击放大后必须真正占满整块。"""
+def test_solo_switches_to_the_big_page(mon):
+    """放大 = 切到独立大图页，而不是把子图在网格里搬来搬去。"""
+    _push(mon, [-112666.0 + (i % 7) for i in range(600)])
+    mon._solo_plot(0)
+    assert mon._solo == 0
+    assert mon._stack.currentWidget() is mon._solo_page
+    assert "返回 14 图" in mon.btn_solo.text()
+    assert "EEG1" in mon._lbl_solo.text()
+
+
+def test_big_page_is_much_taller_than_a_grid_cell(mon, app):
+    """14 图并排时每张只有几像素高；大图必须高出十几倍，否则"还是看不出浮动"。"""
     mon.resize(1200, 760); mon.show()
     _push(mon, [-112666.0 + (i % 7) for i in range(600)])
     for _ in range(2):
         mon._tick(); app.processEvents()
-    h14 = _vb_height(mon)
+    h_cell = _vb_height(mon.plots[0])
     mon._solo_plot(0)
     for _ in range(2):
         mon._tick(); app.processEvents()
-    assert sum(p.isVisible() for p in mon.plots) == 1, "放大后其它通道还在抢版面"
-    assert "还原" in mon.btn_solo.text()
-    solo_h = _vb_height(mon)
-    assert solo_h > h14 * 3, f"放大没生效: {h14:.1f}px -> {solo_h:.1f}px"
+    h_big = _vb_height(mon._big)
+    assert h_cell > 0
+    assert h_big > h_cell * 5, f"大图没撑开: {h_cell:.1f}px -> {h_big:.1f}px"
 
 
-def test_restore_brings_back_all_14(mon, app):
-    mon.resize(1200, 760); mon.show()
-    _push(mon, [-112666.0 + (i % 7) for i in range(600)])
-    mon._solo_plot(2)
-    mon._restore_grid()
-    app.processEvents()
-    assert all(p.isVisible() for p in mon.plots)
+def test_restore_keeps_the_grid_untouched(mon):
+    """放大再还原必须完全可逆：14 个格子的行列位置一个都不许变。
+
+    上一版是在同一张 QGridLayout 里 addWidget 跨满格子来放大，还原后格子被重排，
+    单张可绘区从 5.1px 变成 64.1px —— 这就是"放大缩小逻辑有问题"的来源。
+    """
+    before = [mon._gl.getItemPosition(mon._gl.indexOf(p)) for p in mon.plots]
+    for i in (0, 5, 13):
+        mon._solo_plot(i)
+        mon._restore_grid()
+    after = [mon._gl.getItemPosition(mon._gl.indexOf(p)) for p in mon.plots]
+    assert before == after
+    assert mon._stack.currentWidget() is mon._grid_page
     assert mon._solo is None
-    assert "单通道放大" in mon.btn_solo.text()
+    for r, pos in enumerate(before):
+        assert pos[:2] == (r // mon._ncols, r % mon._ncols), f"第 {r} 张图位置变了: {pos}"
 
 
 def test_solo_button_targets_last_clicked_plot(mon):
@@ -245,10 +261,28 @@ def test_solo_button_targets_last_clicked_plot(mon):
     mon._focus_idx = 3
     mon._toggle_solo()
     assert mon._solo == 3
-    # 窗口没 show 时 isVisible() 恒为 False，这里看"有没有被显式隐藏"
-    assert not mon.plots[3].isHidden() and mon.plots[0].isHidden()
+    assert "EEG4" in mon._lbl_solo.text()
     mon._toggle_solo()
-    assert mon._solo is None and not mon.plots[0].isHidden()
+    assert mon._solo is None
+    assert mon._stack.currentWidget() is mon._grid_page
+
+
+def test_solo_range_uses_only_that_channel(mon):
+    """放大某一路时量程只按它自己算：否则被别路的大信号压成一条线。"""
+    np = pytest.importorskip("numpy")
+    t = np.arange(2000) / 500.0
+    big = 4000.0 * np.sin(2 * np.pi * 3.0 * t)          # CH1 大摆幅
+    small = 20.0 * np.sin(2 * np.pi * 3.0 * t)          # CH2 小摆幅
+    for i in range(len(t)):
+        mon.push_frame(seq=i + 1, eeg_uv=[big[i], small[i], 0.0, 0.0],
+                       hbo=[0.0] * 10, hbr=[0.0] * 10, raw=None, eeg_n=2)
+    mon._tick()
+    s_all = mon.eeg_scale
+    mon._solo_plot(1)                                    # 放大小信号那一路
+    assert mon.eeg_scale < s_all / 20.0, \
+        f"放大 CH2 后量程仍是 {mon.eeg_scale}（14 路全局档 {s_all}），小信号会被压平"
+    mon._restore_grid()
+    assert mon.eeg_scale > s_all / 3.0, "还原后量程要回到按全部通道算"
 
 
 def test_auto_scale_fills_the_height(mon):
