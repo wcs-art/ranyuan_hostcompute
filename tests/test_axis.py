@@ -150,3 +150,59 @@ def test_stops_drawing_after_board_stops(mon, tmp_path):
         mon._tick()
     assert _n_points(mon, 0) == 0, "停发后还在画旧波形"
     assert "停发" in mon.lbl.text(), f"状态栏没提示停发: {mon.lbl.text()}"
+
+
+# ---- 自动量程：抗毛刺 / 空通道提示 -------------------------------------------
+def _push(mon, vals, eeg_n=1):
+    """不接串口，直接按帧喂数据（与 push_frame 的真实入参一致）。"""
+    for i, v in enumerate(vals):
+        mon.push_frame(seq=i + 1, eeg_uv=[float(v), 0.0, 0.0, 0.0],
+                       hbo=[0.0] * 10, hbr=[0.0] * 10, raw=None, eeg_n=eeg_n)
+    mon._tick()
+
+
+def _yspan(mon, i=0):
+    lo, hi = mon.plots[i].getViewBox().viewRange()[1]
+    return float(hi - lo)
+
+
+def test_single_glitch_does_not_flatten_the_waveform(mon):
+    """一个毛刺不能把量程撑到上万。
+
+    现场实测：数据在 -112666 附近波动 ±25，窗口里混进 1 个 -127968 的毛刺，
+    按 max-min 定量程得 21933，真实起伏只占 0.8% 屏高 —— 界面上看起来
+    "一条曲线都没有"。VOFA 同一段数据也被撑大到 283 倍。
+    """
+    np = pytest.importorskip("numpy")
+    rng = np.random.default_rng(0)
+    vals = (-112666.0 + rng.normal(0.0, 25.0, 5000)).tolist()
+    vals[2500] = -127968.1
+    _push(mon, vals)
+    assert _yspan(mon) < 2000.0, f"量程被毛刺撑开: {_yspan(mon)}"
+    assert mon.eeg_scale <= 300.0, f"量程档位还停在 {mon.eeg_scale}"
+
+
+def test_wide_real_signal_still_uses_the_height(mon):
+    """反过来也不能压太死：真有大摆幅（眨眼/体动）时必须撑开量程。"""
+    np = pytest.importorskip("numpy")
+    t = np.arange(5000) / 500.0
+    vals = (-12000.0 + 3000.0 * np.sin(2 * np.pi * 2.0 * t)).tolist()   # 峰峰 6000
+    _push(mon, vals)
+    span = _yspan(mon)
+    assert span > 6000.0, f"6000 的峰峰被压到 {span}"
+    assert 6000.0 / span > 0.3, f"只占 {6000.0 / span:.0%} 屏高"
+
+
+def test_idle_channel_shows_a_hint(mon):
+    """没有数据的子图不能只是一片黑：要写明"本链路未发送该通道"。"""
+    _push(mon, [-8234.32] * 100)
+    assert mon._tips[0].isVisible() is False, "CH1 有数据，不该挂提示"
+    assert mon._tips[1].isVisible() is True, "空通道没有任何提示"
+    assert "无数据" in mon._tips[1].toPlainText()
+
+
+def test_waiting_hint_before_any_frame(mon):
+    """一帧都没收到时，14 张图都该写"等待数据"，而不是留白。"""
+    for _ in range(3):
+        mon._tick()
+    assert all("等待数据" in t.toPlainText() for t in mon._tips)

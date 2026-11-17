@@ -9,6 +9,16 @@ import contract   # _rec_row 依赖它; 缺失时 NameError 会被 _tick 的 exc
 
 N_EEG = 4; N_FNIRS = 10
 
+#: 自动量程用的分位点。不能用 max/min 定量程: 现场一个半包毛刺就能把量程撑到
+#: 上万倍, 真实信号被压成一条直线。实测例子: 数据在 -112666 附近波动 ±40,
+#: 窗口里混进 1 个 -127968 的毛刺, 按 max-min 得量程 21933 -> 起伏只占 0.8%
+#: 屏高, 界面上看起来"一条曲线都没有"; VOFA 同一段数据也是被撑成 283 倍。
+AUTO_Q_LO = 0.5
+AUTO_Q_HI = 99.5
+#: 极端值超过鲁棒半幅的这么多倍才判为毛刺, 否则照样算进量程
+#: (真实的大幅波动如眨眼/运动不该被裁掉)
+AUTO_GLITCH_X = 4.0
+
 class Monitor14(QtWidgets.QMainWindow):
     def __init__(self, eeg_names=None, sim=False):
         super().__init__()
@@ -115,6 +125,7 @@ class Monitor14(QtWidgets.QMainWindow):
         lay.addWidget(scroll)
         self.ch_scroll = scroll  # S1: 主界面嵌入时隐藏内嵌通道条, 只留外部通道开关
         self.plots = []; self.curves = []
+        self._tips = []          # 空子图上的灰字提示(等待数据/本链路未发送该通道)
         gl = QtWidgets.QGridLayout(); lay.addLayout(gl)
         names = ch_labels
         ncols = 2 if self.n_total <= 16 else 4
@@ -130,6 +141,10 @@ class Monitor14(QtWidgets.QMainWindow):
             p.setXRange(0, self.win_s, padding=0)
             p.getViewBox().sigRangeChangedManually.connect(self._on_manual_zoom)
             c = p.plot(pen="y")
+            # 空着的子图不能只是一片黑: 现场分不清"这条链路没送这个通道"和"程序没跑"
+            tip = pg.TextItem("等待数据…", color="#909090", anchor=(0.5, 0.5))
+            tip.setPos(self.win_s / 2.0, 0.0); tip.hide()
+            p.addItem(tip); self._tips.append(tip)
             gl.addWidget(p, r // ncols, r % ncols); self.plots.append(p); self.curves.append(c)
         self.t0 = time.time()
         self.buf_eeg = np.zeros((self.n_eeg, int(self.fs_eeg*30)))
@@ -160,8 +175,10 @@ class Monitor14(QtWidgets.QMainWindow):
         self._reset_x_range()
     def _reset_x_range(self):
         """14 个子图统一横轴：0 ~ win_s 秒，0 = 窗口最左（最早），右端 = 最新数据。"""
-        for p in self.plots:
+        for i, p in enumerate(self.plots):
             p.setXRange(0, self.win_s, padding=0)
+            if i < len(self._tips):
+                self._tips[i].setPos(self.win_s / 2.0, 0.0)
     def _set_follow(self, v: bool):
         self._follow = bool(v)
         if self._follow:
@@ -179,22 +196,46 @@ class Monitor14(QtWidgets.QMainWindow):
                 p.setLabel('left', 'EEG', units=self.eeg_unit)
             else:
                 p.setLabel('left', 'ΔHbO2/ΔHbR', units=self.fnirs_unit)
+    @staticmethod
+    def _robust_span(row):
+        """一段样本 -> (中心, 半幅)，用分位数定量程，单个毛刺不参与。
+
+        返回 None 表示这段没有可用起伏（常数行 / 点数太少），调用方自己兜底。
+        """
+        try:
+            a = np.asarray(row, dtype=float).reshape(-1)
+            a = a[np.isfinite(a)]
+            if a.size < 8:
+                return None
+            lo, hi = np.percentile(a, [AUTO_Q_LO, AUTO_Q_HI])
+            if not (hi > lo):
+                return None                 # 常数通道 = 没有数据
+            mid = (lo + hi) / 2.0
+            half = (hi - lo) / 2.0
+            # 极端值离中心不算太远就并进来：真实的大幅波动(眨眼/体动)不能被裁掉
+            art = max(abs(float(a.min()) - mid), abs(float(a.max()) - mid))
+            if art <= half * AUTO_GLITCH_X:
+                half = art
+            return mid, half
+        except Exception:  # noqa: BLE001
+            return None
+
     def _auto_eeg_scale(self, seg):
         """按实测峰峰值定半幅量程，只改显示范围，不改数据本身。
 
-        两处必须注意：
+        三处必须注意：
         1) 用 (max-min)/2 而不是 max(|x|)：真实信号带直流偏置时（如原始码值在
            -8700 附近），按绝对值定量程会得到 20000 却把波形压在框边。
         2) 跳过最大值等于最小值的通道：单列文本模式下只有 CH1 有数据，其余通道
            全是 0 补位，混进来会把峰峰值从 3000 拉到 12000，量程直接锁死在最高档。
+        3) 量程要抗毛刺（走 _robust_span 的分位数），否则一个坏帧就把整屏压平。
         """
         try:
             spans = []
             for row in np.atleast_2d(seg):
-                if row.size:
-                    lo, hi = float(np.min(row)), float(np.max(row))
-                    if hi != lo:                 # 常数通道 = 没有数据，不参与
-                        spans.append(hi - lo)
+                rs = self._robust_span(row)
+                if rs is not None:
+                    spans.append(rs[1] * 2.0)     # 半幅 -> 峰峰
             peak = max(spans) / 2.0 if spans else 0.0
         except Exception:  # noqa: BLE001
             return
@@ -619,6 +660,8 @@ class Monitor14(QtWidgets.QMainWindow):
         if self._recv == 0 or stale:
             for c in self.curves:
                 c.setData([], [])
+            for tip in self._tips:
+                tip.setText("等待数据…"); tip.show()
             return
         # 缓冲还没填满时，前面的 0 是补位不是数据。拿它算峰峰值会把量程放大一倍
         # （0 到 -8000 的跳变），之后信号一直被压成平线。只画已收到的样本。
@@ -641,14 +684,20 @@ class Monitor14(QtWidgets.QMainWindow):
             # 画出来就是一条贴 0 的假平线，现场会误判成"信号一直是 0"。
             if not (self.ch_enable[i] and self._ch_ok[i]):
                 self.curves[i].setData([], [])
+                self._tips[i].setText("无数据（本链路未发送该通道）")
+                self._tips[i].show()
+                self.plots[i].setYRange(-1.0, 1.0)
                 continue
+            self._tips[i].hide()
             seg = self.buf_eeg[i, -n:]
             self.curves[i].setData(te, seg)
             if not self._follow:
                 continue          # 手动缩放中: 不再抢用户的视野
             if self.eeg_scale_auto and seg.size:
-                # 自动档: 窗口跟着信号中心走, 带直流偏置的原始值也能看清细节
-                mid = float((np.max(seg) + np.min(seg)) / 2.0)
+                # 自动档: 窗口跟着信号中心走, 带直流偏置的原始值也能看清细节。
+                # 中心与量程都走分位数, 单个毛刺不会把整屏压平。
+                rs = self._robust_span(seg)
+                mid = rs[0] if rs is not None else float(np.median(seg))
                 if np.isfinite(mid):
                     self.plots[i].setYRange(mid - self.eeg_scale, mid + self.eeg_scale)
                 else:
@@ -660,7 +709,11 @@ class Monitor14(QtWidgets.QMainWindow):
             k = self.n_eeg + i
             if not (self.ch_enable[k] and self._ch_ok[k]):
                 self.curves[k].setData([], [])
+                self._tips[k].setText("无数据（本链路未发送该通道）")
+                self._tips[k].show()
+                self.plots[k].setYRange(-0.01, 0.01)
                 continue
+            self._tips[k].hide()
             self.curves[k].setData(tf, self.buf_fn[i, -m:])
             self.plots[k].setYRange(-self.fnirs_scale, self.fnirs_scale)
 

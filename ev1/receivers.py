@@ -282,10 +282,20 @@ class SerialReceiver(_ByteReceiver):
         try:
             return serial.Serial(self.com, self.baud, timeout=0.2)
         except Exception as e:  # noqa: BLE001 - pyserial 抛的异常类型很杂
-            raise LinkError(
-                f"串口 {self.com} 打不开: {e}。"
-                f"请确认: 设备已插好、设备管理器里能看到该 COM 口、没有被串口助手占用。"
-            ) from e
+            raw = str(e)
+            # Windows 串口是独占的: 别的程序正开着这个口时报的是 PermissionError,
+            # 现场最常见的元凶就是 VOFA+ / 串口助手 / 另一个上位机实例。
+            # 只说"拒绝访问"没人猜得到要去关 VOFA, 所以按 errno 给下一步。
+            if "PermissionError" in raw or "拒绝访问" in raw:
+                why = (f"串口 {self.com} 被占用（拒绝访问）。"
+                       f"同一个口只能被一个程序打开：请关掉 VOFA+/串口助手/"
+                       f"或另一个上位机实例后重试。")
+            elif "FileNotFoundError" in raw or "找不到" in raw:
+                why = (f"串口 {self.com} 不存在。线没插好，或口名不是这个"
+                       f"（在设备管理器 → 端口(COM 和 LPT) 里看实际编号）。")
+            else:
+                why = f"串口 {self.com} 打不开。"
+            raise LinkError(f"{why} 原始错误: {raw}") from e
 
     def start(self) -> None:
         if self.running:  # 幂等: 入口与界面可能各调一次
