@@ -32,6 +32,19 @@ MIN_SPAN_S = 0.2
 #: 量程回差: 变化不到 ±15% 就不改档, 否则每帧跟着噪声跳
 AUTO_HYST = 1.15
 
+
+class _RawValueAxis(pg.AxisItem):
+    """纵轴刻度永远写收到的原值，不让 pyqtgraph 乘 SI 系数。
+
+    光靠 `enableAutoSIPrefix(False)` 不够：它自己仍会按当前量程算
+    `autoSIPrefixScale`（六位数 -> 0.001），而 `tickStrings` 无条件用这个系数，
+    结果 -161437 被画成 -161.4。这里把系数钉成 1，不管内部状态怎么变。
+    """
+
+    def tickStrings(self, values, scale, spacing):
+        return super().tickStrings(values, 1.0, spacing)
+
+
 class Monitor14(QtWidgets.QMainWindow):
     def __init__(self, eeg_names=None, sim=False):
         super().__init__()
@@ -185,7 +198,8 @@ class Monitor14(QtWidgets.QMainWindow):
         self._gl = gl
         self._stack.addWidget(self._grid_page)
         for r, n in enumerate(names):
-            p = pg.PlotWidget(title=n); p.showGrid(x=True, y=True)
+            p = pg.PlotWidget(title=n, axisItems={'left': _RawValueAxis('left')})
+            p.showGrid(x=True, y=True)
             # 只让鼠标改横轴：纵轴永远由程序按可见数据贴合（自动档）或按标尺固定档。
             # 之前 x/y 都开放，滚轮一下就把 Y 也缩了/拖了，数据跑出窗口后屏幕上什么都没有，
             # 现场以为是"放大以后数据消失了"。横轴缩放才是这里真正需要的操作。
@@ -232,7 +246,8 @@ class Monitor14(QtWidgets.QMainWindow):
         self._btn_back.clicked.connect(self._restore_grid)
         head.addWidget(self._lbl_solo, 1); head.addWidget(self._btn_back)
         sl.addLayout(head)
-        self._big = pg.PlotWidget(); self._big.showGrid(x=True, y=True)
+        self._big = pg.PlotWidget(axisItems={'left': _RawValueAxis('left')})
+        self._big.showGrid(x=True, y=True)
         self._big.setMouseEnabled(x=True, y=False)   # 纵轴恒由数据贴合，见网格页注释
         self._big.setLabel('bottom', '时间', units='s')
         self._big.setXRange(0, self.win_s, padding=0)
@@ -330,6 +345,15 @@ class Monitor14(QtWidgets.QMainWindow):
             try:
                 ax = plot.getAxis(name)
                 ax.enableAutoSIPrefix(False)
+                # 关键：pyqtgraph 的 enableAutoSIPrefix(False) 只是把标志置 False，
+                # 它自己仍会调 updateAutoSIPrefix()。若此刻 Y 量程已经是 -161437
+                # 这种六位数，内部 autoSIPrefixScale 会被写成 0.001；之后
+                # generateDrawSpecs 一律按 `值 × scale` 生成刻度文字，
+                # 于是一放大就显示 -161.5 —— 正是现场"数字被藏了几位"。
+                # 标志关了不等于系数是 1，必须一起按回去。
+                ax.autoSIPrefixScale = 1.0
+                ax.labelUnitPrefix = ''
+                ax._updateLabel()       # 标签里的"(k原始值)"也要一并去掉
                 # 轴线和刻度文字分开设：setPen 只管轴线/刻度，不保证管文字
                 ax.setPen(pg.mkPen('#c8c8c8'))
                 ax.setTextPen(pg.mkPen('#e6e6e6'))

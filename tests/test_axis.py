@@ -695,3 +695,49 @@ def test_solo_axis_keeps_raw_unit_and_six_digit_ticks(mon, app, tmp_path):
     labels = [spec[2].strip() for spec in texts]
     assert any(x.startswith("-166") for x in labels), f"放大页刻度不是六位原值: {labels[:6]}"
     assert not any(x in ("-166", "-166.2") for x in labels), f"刻度被缩小 1000 倍: {labels[:6]}"
+
+
+def test_relabel_at_large_range_does_not_shrink_ticks(mon, app):
+    """[规格] 大量程时再设一次轴标签，刻度不许变成 -161.5。
+
+    现场对照：网格读数 -161437/-162058，放大页刻度却是 -161.5。
+    根因不是 autoSIPrefix 标志：pyqtgraph 的 enableAutoSIPrefix(False)
+    自己仍会按当前量程算 autoSIPrefixScale（六位数 -> 0.001），
+    而 tickStrings 无条件把刻度值乘这个系数。标志关了，系数还是 0.001。
+    """
+    from PyQt5 import QtGui
+
+    mon.fs_eeg = mon.fs_fnirs = 500.0
+    _push(mon, [-161437.0 + (i % 7) * 5 for i in range(1000)])
+    mon.show()
+    for _ in range(4):
+        app.processEvents()
+    mon._solo_plot(0)
+    for _ in range(4):
+        app.processEvents()
+    ax = mon._big.getAxis("left")
+
+    def labels():
+        img = QtGui.QImage(10, 10, QtGui.QImage.Format_ARGB32)
+        p = QtGui.QPainter(img)
+        if ax.style["tickFont"] is not None:
+            p.setFont(ax.style["tickFont"])
+        ax.picture = None
+        try:
+            _, _, texts = ax.generateDrawSpecs(p)
+        finally:
+            p.end()
+        return [spec[2].strip() for spec in texts]
+
+    assert any(x.startswith("-1614") for x in labels()), "首次放大就不是六位刻度"
+    # 现场等价动作：换链路/再切一次通道时 _apply_axis_labels 会重设标签，
+    # 那一刻 Y 量程已经是十几万，正是旧实现把 0.001 写进去的时机
+    mon._set_left_label(mon._big, 0)
+    for _ in range(4):
+        app.processEvents()
+    assert ax.autoSIPrefix is False
+    assert ax.autoSIPrefixScale == 1.0, f"SI 系数被写成 {ax.autoSIPrefixScale}"
+    assert ax.labelUnitPrefix == "", f"轴标签混进了前缀 {ax.labelUnitPrefix!r}"
+    now = labels()
+    assert any(x.startswith("-1614") for x in now), f"再设标签后刻度缩水: {now[:6]}"
+    assert not any(x.startswith("-161.") for x in now), f"出现 -161.5 这类三位数: {now[:6]}"
