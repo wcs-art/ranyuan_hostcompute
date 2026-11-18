@@ -595,3 +595,103 @@ def test_stale_labels_are_hidden_when_board_stops(mon):
     mon._t_rx = time.time() - 5.0
     mon._tick()
     assert mon._ylbl_hi[0].isHidden() and mon._ylbl_lo[0].isHidden()
+
+
+class _CountingSource:
+    """只数 poll 次数，不造数据：验证"暂停期间 force 重绘不许取帧"。"""
+
+    kind = "text"
+
+    def __init__(self):
+        self.polls = 0
+
+    def poll_frames(self):
+        self.polls += 1
+        return []
+
+    def measured_fps(self):
+        return 500.0
+
+    def stats(self):
+        return {}
+
+
+def test_paused_zoom_keeps_view_and_does_not_poll(mon):
+    """[规格] 暂停后放大：视野留在原段、不偷偷取帧、跟随状态不变。
+
+    现场操作链：手动缩到一段 -> 点暂停 -> 双击放大。旧实现里 _solo_plot 强制
+    follow=True + _reset_x_range()，而且 force=True 连暂停都绕过照样 poll，
+    结果一放大就跳到最新一段，看起来"暂停只显示最后一段时间"。
+    """
+    src = _CountingSource()
+    mon.attach_receiver(src)
+    mon.fs_eeg = mon.fs_fnirs = 500.0
+    _push(mon, [-166000.0 + (i % 40) for i in range(20000)])   # 40 s
+    mon.plots[0].setXRange(15.0, 25.0, padding=0)
+    mon._on_manual_zoom(0)
+    mon._tick(force=True)
+    assert _xrange(mon.plots[0]) == (15.0, 25.0)
+    polls, recv = src.polls, mon._recv
+
+    mon.paused = True
+    mon._solo_plot(0)
+    assert src.polls == polls, f"暂停期间放大 poll 了 {src.polls - polls} 次"
+    assert mon._recv == recv, "暂停期间取到了新帧"
+    assert _xrange(mon._big) == (15.0, 25.0), f"放大后跳到 {_xrange(mon._big)}"
+    assert mon._follow is False, "放大把手动缩放状态冲掉了"
+    assert _n_points(mon, 0) > 0, "放大后曲线没了"
+
+    mon._restore_grid()
+    assert _xrange(mon.plots[0]) == (15.0, 25.0), "还原到网格又跳回最新"
+    assert mon._follow is False
+
+
+def test_long_pause_then_zoom_keeps_waveform(mon):
+    """[规格] 暂停超过 2 s 再放大，不许把冻结的波形判成"停发"清掉。"""
+    mon.fs_eeg = mon.fs_fnirs = 500.0
+    _push(mon, [-166000.0 + (i % 40) for i in range(5000)])
+    mon.paused = True
+    mon._t_rx = time.time() - 10.0
+    mon._solo_plot(0)
+    d = mon._big_curve.getData()
+    assert d[0] is not None and len(d[0]) > 0, "暂停久了再放大，曲线被清空"
+    assert not mon._big_tip.isVisible(), f"不该显示 {mon._big_tip.toPlainText()!r}"
+
+
+def test_solo_axis_keeps_raw_unit_and_six_digit_ticks(mon, app, tmp_path):
+    """[规格] 文本链路放大后数值不能被缩小 1000 倍，单位也不能变成 μV。
+
+    现场对照：网格读数是 -166233，放大页纵轴却是 -165.0 —— pyqtgraph 的
+    autoSIPrefix 把六位数写成三位并吞掉乘数。验证的是轴真正生成的文字，
+    不是只看 autoSIPrefix 标志（离屏机器画不出字，但 generateDrawSpecs 有文字）。
+    """
+    from PyQt5 import QtGui
+    from text_source import TextFileSource
+
+    p = tmp_path / "raw.txt"
+    p.write_bytes(b"-166233.0\r\n" * 600)
+    mon.attach_receiver(TextFileSource(p))
+    mon.fs_eeg = mon.fs_fnirs = 500.0
+    for _ in range(30):
+        mon._tick(force=True)
+    mon._solo_plot(0)
+    mon._tick(force=True)
+    mon.show()
+    for _ in range(4):
+        app.processEvents()
+
+    ax = mon._big.getAxis("left")
+    assert ax.autoSIPrefix is False
+    assert ax.labelUnits == mon.eeg_unit and "原始值" in ax.labelUnits
+    assert "原始值" in mon._lbl_solo.text(), "放大页标题没写单位"
+    img = QtGui.QImage(10, 10, QtGui.QImage.Format_ARGB32)
+    painter = QtGui.QPainter(img)
+    painter.setFont(ax.style["tickFont"])
+    ax.picture = None                      # 强制重新生成，避免拿到旧缓存的空规格
+    try:
+        _, _, texts = ax.generateDrawSpecs(painter)
+    finally:
+        painter.end()
+    labels = [spec[2].strip() for spec in texts]
+    assert any(x.startswith("-166") for x in labels), f"放大页刻度不是六位原值: {labels[:6]}"
+    assert not any(x in ("-166", "-166.2") for x in labels), f"刻度被缩小 1000 倍: {labels[:6]}"

@@ -286,6 +286,12 @@ class Monitor14(QtWidgets.QMainWindow):
     def _title_of(self, i: int) -> str:
         return self._names[i] if i < len(self._names) else f"CH{i+1}"
 
+    def _solo_header(self, i: int) -> str:
+        """放大页标题必须写单位：网格只标"EEG"，换页后看不出数值有没有被缩放。"""
+        unit = self.eeg_unit if i < self.n_eeg else self.fnirs_unit
+        return (f"{self._title_of(i)}　单通道放大 · 纵轴单位：{unit}"
+                "（双击波形 / 按 Esc / 点右上角返回）")
+
     def _set_left_label(self, plot, i: int, short: bool = False):
         """纵轴单位跟着通道与链路走：fNIRS 是 mM，文本链路的 EEG 是"单位待定"。
 
@@ -347,31 +353,35 @@ class Monitor14(QtWidgets.QMainWindow):
             self._restore_grid()
 
     def _solo_plot(self, i: int):
-        """放大第 i 路：切成大图页，并只按这一路重新算量程。"""
+        """放大第 i 路：切成大图页，保留原时间视野，只按这一路重新算量程。"""
         if not (0 <= i < len(self.plots)):
             return
         self._solo = i
-        self._lbl_solo.setText(f"{self._title_of(i)}　单通道放大（双击波形 / 按 Esc / 点右上角返回）")
+        self._zoom_src = i if i < self.n_total else -1
+        self._lbl_solo.setText(self._solo_header(i))
         self._set_left_label(self._big, i)
         self._big.setTitle("")
+        # 放大只换页，不跳时间：网格里缩到哪一段，放大后就看哪一段。
+        # 旧写法强制 follow=True + _reset_x_range()，把用户刚缩好的视野丢了，
+        # 暂停后再放大就直接跳到最新一段（现场："暂停只显示一段时间"）。
+        lo, hi = self._view_bounds(self.plots[i])
+        self._big.setXRange(lo, hi, padding=0)
         self._stack.setCurrentWidget(self._solo_page)
         self.btn_solo.setText("⤢ 返回 14 图")
-        # 放大就是要看细节：恢复自动跟随，别继承之前拖拽留下的冻结状态
-        self._follow = True
-        self.btn_follow.setChecked(True)
-        self._reset_x_range()
+        # _follow / btn_follow 原样保留：手动缩放过就继续停在那一段
         self._tick(force=True)            # 立刻重画，不要等下一个 40ms 节拍
 
     def _restore_grid(self):
-        """回到 14 图并排。网格从未被改动过，切页即可回到原样。"""
+        """回到 14 图并排。时间视野与跟随状态都原样带回来。"""
         if self._solo is None:
             return
+        lo, hi = self._view_bounds(self._big)
+        self._zoom_src = self._solo if 0 <= self._solo < self.n_total else 0
         self._solo = None
+        for p in self.plots:
+            p.setXRange(lo, hi, padding=0)
         self._stack.setCurrentWidget(self._grid_page)
         self.btn_solo.setText("⤢ 单通道放大")
-        self._follow = True
-        self.btn_follow.setChecked(True)
-        self._reset_x_range()
         self._tick(force=True)
     def _set_eeg_scale(self, i: int):
         """幅度标尺: 0=自动, 1~3=固定 ±100/±200/±500μV。"""
@@ -442,6 +452,7 @@ class Monitor14(QtWidgets.QMainWindow):
             self._set_left_label(p, i, short=True)
         if self._solo is not None:
             self._set_left_label(self._big, self._solo)
+            self._lbl_solo.setText(self._solo_header(self._solo))
     @staticmethod
     def _robust_span(row):
         """一段样本 -> (中心, 半幅)，用分位数定量程，单个毛刺不参与。
@@ -897,10 +908,13 @@ class Monitor14(QtWidgets.QMainWindow):
             self.fs_fnirs = self.fs_eeg
 
     def _tick(self, force: bool = False):
-        # force=True: 放大/还原这种用户动作要立刻重画，不能被"暂停"挡住
+        # force=True 只表示"用户动作要立刻重画"，不表示"暂停期间继续收数据"。
+        # 旧写法把两件事绑在一起：暂停后双击放大(force)会偷偷取走串口缓冲里的帧，
+        # 时间轴跟着往前跳 —— 现场就是"暂停了还在动 / 只剩最后一段"。
         if self.paused and not force: return
+        frozen = self.paused
         # 唯一数据入口: _receiver。没有 receiver 就不产生任何数据(不造数)。
-        if self._receiver is not None:
+        if not frozen and self._receiver is not None:
             # 实机/录播: 每节拍取帧并push, 解析(帧头/seq/μV折算/事件)在receivers+device_frame里做
             try:
                 for fr in self._receiver.poll_frames():
@@ -915,11 +929,13 @@ class Monitor14(QtWidgets.QMainWindow):
             self._update_rate()
         # 状态栏独立刷新: 一帧没到也要显示"等待数据", 不能等 push_frame 才更新
         self._st_tick += 1
-        if self._st_tick % 5 == 0:
+        if self._st_tick % 5 == 0 and not frozen:
             self._refresh_status()
         # 只画真数据：一帧都没收到，或板子已停发超过 2 s，就把曲线清空。
-        # 否则缓冲区里的历史波形会一直留在屏上，看着像板子还在发。
-        stale = self._t_rx is None or (time.time() - self._t_rx) > 2.0
+        # 暂停时不能用挂钟判"停发"：用户停了 10 s 再看，缓冲区里的波形仍是他要分析的，
+        # 一按放大就被判 stale 清成"等待数据…"，等于暂停功能失效。
+        stale = False if frozen else (
+            self._t_rx is None or (time.time() - self._t_rx) > 2.0)
         if self._recv == 0 or stale:
             for c in self.curves:
                 c.setData([], [])
