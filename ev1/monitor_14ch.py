@@ -110,8 +110,12 @@ class Monitor14(QtWidgets.QMainWindow):
         self.btn_pause.toggled.connect(lambda v: setattr(self, "paused", v))
         self.cmb_fnirs = QtWidgets.QComboBox(); self.cmb_fnirs.addItems(["ΔHbO2", "ΔHbR"])
         self.cmb_fnirs.currentIndexChanged.connect(lambda i: setattr(self, "show_hbo", i == 0))
-        self.cmb_win = QtWidgets.QComboBox(); self.cmb_win.addItems(["5s", "10s", "30s"])
-        self.cmb_win.setCurrentIndex(1)
+        # 时间窗口档位：上限 30s 与环形缓冲容量一致（buf_eeg/fs_eeg = 30）。
+        # 再大的档横轴会画出来但波形已被覆盖成空白，现场会当成没数据。
+        self.WIN_CHOICES = (1.0, 2.0, 3.0, 5.0, 10.0, 15.0, 20.0, 25.0, 30.0)
+        self.cmb_win = QtWidgets.QComboBox()
+        self.cmb_win.addItems([f"{v:g}s" for v in self.WIN_CHOICES])
+        self.cmb_win.setCurrentIndex(self.WIN_CHOICES.index(10.0))
         self.cmb_win.currentIndexChanged.connect(self._set_win)
         # 默认自动量程：真机增益未知时固定量程会把波形画到框外
         self.eeg_scale_auto = True
@@ -423,7 +427,9 @@ class Monitor14(QtWidgets.QMainWindow):
     # ---- 时间轴 / 跟随 ----
     def _set_win(self, i: int):
         """时间窗切换后立刻重设横轴，不然要等下一次重绘才对齐。"""
-        self.win_s = (5.0, 10.0, 30.0)[i]
+        if i < 0 or i >= len(self.WIN_CHOICES):
+            return
+        self.win_s = self.WIN_CHOICES[i]
         self._recalc_x_left()
         self._reset_x_range()
         self._tick(force=True)

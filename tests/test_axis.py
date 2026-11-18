@@ -43,13 +43,25 @@ def test_all_channels_share_one_time_axis(mon):
 
 
 def test_window_switch_moves_axis(mon):
-    """切 5s / 30s 时间窗，横轴要立刻跟着变，不能等下次重绘。"""
-    mon.cmb_win.setCurrentIndex(0)          # 5s
+    """切 5s / 30s 时间窗，横轴要立刻跟着变，不能等下次重绘。
+
+    按秒数查索引而不是写死 0/2：档位表扩展后测试仍指向同一秒数。
+    """
+    mon.cmb_win.setCurrentIndex(mon.WIN_CHOICES.index(5.0))
     for p in mon.plots:
         assert _xrange(p) == (0.0, 5.0)
-    mon.cmb_win.setCurrentIndex(2)          # 30s
+    mon.cmb_win.setCurrentIndex(mon.WIN_CHOICES.index(30.0))
     for p in mon.plots:
         assert _xrange(p) == (0.0, 30.0)
+
+
+def test_window_choices_within_buffer_capacity(mon):
+    """[规格] 所有可选窗口都必须能被环形缓冲覆盖，否则选了就是看空白。"""
+    cap_e = mon.buf_eeg.shape[1] / mon.fs_eeg
+    cap_f = mon.buf_fn.shape[1] / mon.fs_fnirs
+    assert min(cap_e, cap_f) >= max(mon.WIN_CHOICES), \
+        f"缓冲 EEG {cap_e}s / fNIRS {cap_f}s 小于最大档 {max(mon.WIN_CHOICES)}s"
+    assert 1.0 in mon.WIN_CHOICES and 30.0 in mon.WIN_CHOICES
 
 
 def test_axis_labels_carry_units(mon):
