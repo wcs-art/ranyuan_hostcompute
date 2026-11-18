@@ -18,6 +18,7 @@
 """
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
@@ -51,6 +52,8 @@ class Frame:
     od: Optional[list[float]] = None                           # 20 路光密度, None=未算
     hbo: Optional[list[float]] = None                          # 10 通道 dHbO
     hbr: Optional[list[float]] = None                          # 10 通道 dHbR
+    hbt: Optional[list[float]] = None                          # 10 通道 dHbT = dHbO+dHbR
+    sto2: Optional[list[float]] = None                         # 10 通道变化量氧合占比(非绝对 StO2)
     acc_xyz: Optional[list[float]] = None
     gyro_xyz: Optional[list[float]] = None
     battery_pct: float = -1.0                                  # <0 表示设备未上报
@@ -87,10 +90,14 @@ REQUIRED_COLUMNS: list[str] = (
 )
 
 #: S2 原文列为"可选存 OD 与 ΔHbO/ΔHbR" —— 逐通道存, 不用均值压缩。
+#: 文档《fNIRS和血氧计算20261012---VR002》§1.3 的输出指标追加 ΔHbT 与
+#: 变化量氧合占比; 列名带 delta 后缀, 防止下游把它当绝对 StO₂ 用。
 OPTIONAL_S2_COLUMNS: list[str] = (
     _od_cols()
     + [f"hbo_{c}" for c in range(1, N_FNIRS + 1)]
     + [f"hbr_{c}" for c in range(1, N_FNIRS + 1)]
+    + [f"hbt_{c}" for c in range(1, N_FNIRS + 1)]
+    + [f"sto2_delta_{c}" for c in range(1, N_FNIRS + 1)]
 )
 
 #: 交付范围外: 6 列 S8 姿态 + 4 列 S9 指标。默认不写, 由 --extra-cols 打开。
@@ -233,6 +240,8 @@ def frame_to_row(fr: Frame, optional: bool = False, extra: bool = False,
         row += [_num(v) if v is not None else "" for v in _flat(fr.od, N_FNIRS * len(FNIRS_WLS))]
         row += [_num(v) if v is not None else "" for v in _flat(fr.hbo, N_FNIRS)]
         row += [_num(v) if v is not None else "" for v in _flat(fr.hbr, N_FNIRS)]
+        row += [_num(v) if v is not None else "" for v in _flat(fr.hbt, N_FNIRS)]
+        row += [_num(v) if v is not None else "" for v in _flat(fr.sto2, N_FNIRS)]
     if extra:
         row += [_num(v) if v is not None else "" for v in (fr.acc_xyz or [None] * 3)]
         row += [_num(v) if v is not None else "" for v in (fr.gyro_xyz or [None] * 3)]
@@ -248,5 +257,7 @@ def _num(v: Any) -> Any:
     if v is None:
         return ""
     if isinstance(v, float):
-        return round(v, 6)
+        # NaN/Inf 是"无有效值", 不是 0。写成 nan 字符串会让下游 pandas 读成
+        # 文本列; 写成 0 更糟 —— 看起来像合法读数。
+        return round(v, 6) if math.isfinite(v) else ""
     return v

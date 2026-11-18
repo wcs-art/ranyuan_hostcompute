@@ -66,11 +66,15 @@ class Monitor14(QtWidgets.QMainWindow):
         # 光强换算系数只从 derive.FnirsOpticalParams 取一次；文献/定标值到了只改那一处。
         self.lux_per_lsb = float(_derive_default_params().lux_per_lsb)
         self._last_od = None     # 最近一帧的 20 路 ΔOD, 有则写入 CSV 的 OD 列
+        self._last_hbt = None    # 最近一帧的 10 路 ΔHbT (文档 §1.3)
+        self._last_sto2 = None   # 最近一帧的 10 路变化量氧合占比(非绝对 StO₂)
+        self._last_mask = None   # 最近一帧的 10 路质控有效位, 异常通道 CSV 写空
         # 前 n_baseline 帧建基线 I0，之后逐帧做 MBLL
         self.n_baseline = 200          # 200 帧 @100Hz = 2 s 基线窗
         self._base_buf = []            # 基线期收集的原始行
         self._base_rows = None         # 建好的 I0, 形状 (20,)
         self.n_mbll_singular = 0       # 矩阵奇异被置 NaN 的次数(现场坏道计数)
+        self.n_mbll_masked = 0         # 质控判异常、按文档 §1.5 不参与反解的次数
         self.extra_cols = False  # 是否写 S8 姿态/S9 指标扩展列(默认不写)
         self.eeg_scale = 100.0; self.fnirs_scale = 0.5
         # 轴单位: 二进制链路是折算后的 μV / mM; 文本链路的单位还没确认, 只能标"原始值"
@@ -674,6 +678,16 @@ class Monitor14(QtWidgets.QMainWindow):
         n_inten = contract.N_FNIRS*len(contract.FNIRS_WLS)
         raw20 = [float(v) for v in (raw or [])][:n_inten]
         raw20 += [0.0]*(n_inten-len(raw20))
+
+        def _by_ch(vals):
+            """定长 10 路; 质控判异常的通道写 None -> CSV 空串(不写 0 冒充结果)。"""
+            v = [float(x) for x in (vals or [])][:contract.N_FNIRS]
+            v += [0.0]*(contract.N_FNIRS-len(v))
+            m = getattr(self, "_last_mask", None)
+            if m is None or len(m) < contract.N_FNIRS:
+                return v
+            return [x if ok else None for ok, x in zip(m, v)]
+
         fr = contract.Frame(
             # 合同 F2 要求"支持上位机区分 ≥8 台设备同时在线" —— 必须写帧头里的真实编号,
             # 不能写死 1: 两台设备同时录制会混成一份无法分辨的记录。
@@ -684,8 +698,10 @@ class Monitor14(QtWidgets.QMainWindow):
             fnirs_raw=contract.unnest_raw(raw20),
             fnirs_intensity=[round(v*self.lux_per_lsb, 4) for v in raw20],
             od=list(getattr(self, "_last_od", None) or []) or None,   # 已建基线即写真值
-            hbo=[float(v) for v in (hbo or [])],
-            hbr=[float(v) for v in (hbr or [])],
+            hbo=_by_ch(hbo),
+            hbr=_by_ch(hbr),
+            hbt=_by_ch(self._last_hbt),
+            sto2=_by_ch(self._last_sto2),
             acc_xyz=list(acc_xyz) if acc_xyz is not None else None,
             gyro_xyz=list(gyro_xyz) if gyro_xyz is not None else None,
             battery_pct=float(battery),
@@ -706,7 +722,14 @@ class Monitor14(QtWidgets.QMainWindow):
         if self._n_saved % 100 == 0:
             self.lbl_store.setText(f"● 记录中: {self._csv_path.name} ({self._n_saved}行)")
     def _derive_fnirs(self, raw):
-        """20 路光强码值 -> (ΔHbO[10], ΔHbR[10])；基线未建完时返回 None。"""
+        """20 路码值 -> (ΔHbO[10], ΔHbR[10], ΔOD[20])；基线未建完时返回 None。
+
+        文档 §1.5: 异常通道不做处理。这里的 valid 取自每 25 帧刷新的
+        质控结果, 因此门控最多滞后 25 帧; 被排除的通道在 CSV 里写空。
+        """
+        self._last_mask = None
+        self._last_hbt = None
+        self._last_sto2 = None
         if raw is None:
             return None
         try:
@@ -719,13 +742,25 @@ class Monitor14(QtWidgets.QMainWindow):
                     return None
                 self._base_rows = np.vstack(self._base_buf).mean(axis=0)
                 self._base_buf = []
-            from derive import raw_to_lux, od_delta, mbll_batch
+            from derive import raw_to_lux, od_delta, mbll_batch, hb_metrics
             lux = raw_to_lux(r)                      # 码值 -> 光强
             od = od_delta(lux, self._base_rows)      # ΔOD = -ln(I/I0)
-            res = mbll_batch(od[0::2], od[1::2])     # 760 / 850 两支
+            valid = None
+            q = getattr(self, "fnirs_quality", None)
+            if q is not None and len(q) == contract.N_FNIRS:
+                from quality import mask_from_flags
+                valid = mask_from_flags(q)
+            res = mbll_batch(od[0::2], od[1::2], valid=valid)  # 760 / 850 两支
             self.n_mbll_singular += int(res.n_singular)
+            self.n_mbll_masked += int(res.n_masked)
+            if valid is not None:
+                self._last_mask = [bool(v) for v in valid]
             hbo = np.nan_to_num(res.hbo_mM, nan=0.0)
             hbr = np.nan_to_num(res.hbr_mM, nan=0.0)
+            met = hb_metrics(res.hbo_mM, res.hbr_mM)  # §1.3 ΔHbT / 变化量占比
+            self._last_hbt = np.nan_to_num(met.hbt_mM, nan=0.0).tolist()
+            # 占比无意义时保留 NaN: 契约层会写成空串, 不能把 0 当成正常读数
+            self._last_sto2 = met.sto2_delta.tolist()
             return hbo.tolist(), hbr.tolist(), od.tolist()
         except Exception:
             return None
@@ -734,9 +769,12 @@ class Monitor14(QtWidgets.QMainWindow):
         """状态栏用的 fNIRS 计算状态, 用于区分"没数据"和"没算完"。"""
         if self._base_rows is None:
             return f"基线 {len(self._base_buf)}/{self.n_baseline}"
+        bits = []
         if self.n_mbll_singular > 0:
-            return f"正常(奇异{self.n_mbll_singular})"
-        return "正常"
+            bits.append(f"奇异{self.n_mbll_singular}")
+        if self.n_mbll_masked > 0:
+            bits.append(f"质控排除{self.n_mbll_masked}")
+        return f"正常({'、'.join(bits)})" if bits else "正常"
 
     def push_frame(self, seq, eeg_uv, hbo, hbr, raw=None, battery=-1.0, acc_xyz=None, gyro_xyz=None,
                    ts_abs_ms=0, event_type=0, event_ts=0, device_id=1, eeg_n=None, t_dev_ms=None):

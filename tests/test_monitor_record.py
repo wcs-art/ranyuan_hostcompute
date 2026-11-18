@@ -33,7 +33,7 @@ def _monitor(app):
 
 # 1 -----------------------------------------------------------------------
 def test_recording_writes_rows_with_full_columns(app, tmp_path, monkeypatch):
-    """[规格, S2] 点开始记录后必须真的落盘, 且行宽等于表头(92 列, 含可选组)。"""
+    """[规格, S2] 点开始记录后必须真的落盘, 且行宽等于表头(列数从契约推导)。"""
     w = _monitor(app)
     monkeypatch.chdir(tmp_path)
     w.btn_record.setChecked(True)
@@ -46,7 +46,11 @@ def test_recording_writes_rows_with_full_columns(app, tmp_path, monkeypatch):
     assert path is not None and path.exists(), "记录没有产生文件"
     rows = list(csv.DictReader(open(path, encoding="utf-8-sig")))
     assert len(rows) == 30
-    assert len(rows[0]) == len(contract.csv_header(optional=True)) == 92
+    header = contract.csv_header(optional=True)
+    assert len(rows[0]) == len(header)
+    # 文档 §1.3 的输出指标: 10 路 ΔHbT + 10 路变化量占比
+    assert len([c for c in header if c.startswith("hbt_")]) == contract.N_FNIRS
+    assert len([c for c in header if c.startswith("sto2_delta_")]) == contract.N_FNIRS
 
 
 # 2 -----------------------------------------------------------------------

@@ -9,6 +9,8 @@ from __future__ import annotations
 import numpy as np
 
 from derive import FnirsOpticalParams
+from derive import HbMetrics
+from derive import hb_metrics as _hb_metrics
 from derive import mbll as _mbll
 from derive import od_delta as _od_delta
 from derive import raw_to_lux as _raw_to_lux
@@ -31,3 +33,9 @@ def mbll(
 ) -> tuple[float, float]:
     """单通道双波长 -> (dHbO, dHbR) mM。矩阵奇异时 (nan, nan), 不抛异常。"""
     return _mbll(od760, od850, params)
+
+
+def hb_metrics(hbo_mM, hbr_mM,
+               params: FnirsOpticalParams | None = None) -> HbMetrics:
+    """dHbT 与变化量氧合占比, 转发到 derive 的唯一实现。"""
+    return _hb_metrics(hbo_mM, hbr_mM, params)
