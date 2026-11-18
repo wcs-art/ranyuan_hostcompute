@@ -82,4 +82,105 @@ def log(msg: str) -> None:
 
 
 def popup(title: str, msg: str) -> None:
-    """没有控制台时用系统弹窗告知原因, 避免"双击闪退、什么都不知�
+    """没有控制台时用系统弹窗告知原因, 避免"双击闪退、什么都不知道"。"""
+    try:
+        import ctypes
+
+        ctypes.windll.user32.MessageBoxW(0, msg, title, 0x10)
+    except Exception:  # noqa: BLE001 - 非 Windows 或无 GUI 时忽略
+        pass
+
+
+def install_crash_hook() -> None:
+    """兜底: 未捕获异常写日志 + 弹窗, 而不是静默退出。"""
+
+    def _hook(exc_type, exc, tb):
+        text = "".join(traceback.format_exception(exc_type, exc, tb))
+        log("[CRASH] 未捕获异常:\n" + text)
+        popup("上位机异常退出", f"{exc_type.__name__}: {exc}\n\n详细日志: {_log_file()}")
+        sys.__excepthook__(exc_type, exc, tb)
+
+    sys.excepthook = _hook
+
+
+def _run_dry_headless(src) -> int:
+    """脱机回放: 不开窗口, 只统计帧数/序号连续性。B1 脱机门禁的入口。"""
+    import time as _t
+
+    t0 = _t.time()
+    n = 0
+    first_seq = last_seq = None
+    gaps = 0
+    while True:
+        frames = src.poll_frames()
+        if not frames:
+            if src.exhausted:
+                break
+            continue
+        for f in frames:
+            if first_seq is None:
+                first_seq = f["seq"]
+            elif last_seq is not None and f["seq"] != last_seq + 1:
+                gaps += 1
+            last_seq = f["seq"]
+            n += 1
+    dt = _t.time() - t0
+    print(f"[dry] 文件      : {src.path}")
+    print(f"[dry] 字节      : {len(src._data)}")
+    print(f"[dry] 帧数      : {n}")
+    print(f"[dry] seq 范围  : {first_seq} .. {last_seq}")
+    print(f"[dry] 序号断点  : {gaps}")
+    print(f"[dry] 耗时      : {dt*1000:.1f} ms")
+    return 0 if n > 0 else 2
+
+
+def main() -> None:
+    install_crash_hook()
+    _ensure_on_path(ROOT / "ev1")
+    from source import make_source, parse_argv
+
+    opts = parse_argv(sys.argv[1:], base=_load_run_config())
+    log(f"启动: source={opts['source']} proto={opts['proto']} port={opts['port']} "
+        f"host={opts['host']} com={opts['com']} baud={opts['baud']} raw_dump={opts['raw_dump']} "
+        f"protocol={opts['protocol']} eeg_gain={opts['eeg_gain']} eeg_vref={opts['eeg_vref']} "
+        f"eeg_preamp_gain={opts.get('eeg_preamp_gain')}")
+
+    # 链路打不开不等于程序要退出: 现场最常见的是"线还没插/插错口/被别的工具占着",
+    # 此时最需要的是界面照常打开, 让人能在里面改端口重试, 而不是闪退加一个弹窗。
+    src = None
+    start_err = None
+    try:
+        src = make_source(
+            opts["source"], port=opts["port"], proto=opts["proto"], path=opts["replay"],
+            host=opts["host"], com=opts["com"], baud=opts["baud"],
+            raw_dump=opts["raw_dump"],
+            protocol=opts["protocol"], eeg_gain=opts["eeg_gain"], eeg_vref=opts["eeg_vref"],
+            eeg_preamp_gain=opts.get("eeg_preamp_gain"),
+        )
+    except SystemExit:
+        raise                      # 参数本身写错(如 --source=dry 缺 --replay), 该报错就报错
+    except Exception as e:  # noqa: BLE001 - 链路失败要给现场一句话原因
+        start_err = str(e)
+        log(f"[WARN] 数据源创建失败: {e} —— 窗口照常打开, 请手动选择链路")
+
+    if src is not None and opts["source"] == "dry" and opts["headless"]:
+        raise SystemExit(_run_dry_headless(src))
+
+    # 链路在这里就打开: 端口占用/串口被占/模组连不上, 都在这步暴露
+    if src is not None:
+        try:
+            src.start()
+        except Exception as e:  # noqa: BLE001
+            start_err = str(e)
+            log(f"[WARN] 链路启动失败: {e} —— 窗口照常打开, 可在界面改端口/类型后重新连接")
+        else:
+            log(f"链路已就绪: {type(src).__name__}")
+            if opts["source"] == "sim":
+                log("[WARN] 当前为合成数据(source=sim), 波形不是真机数据 —— 仅用于自检")
+
+    from main_window import main as new_main
+    new_main(source=src, extra_cols=opts["extra_cols"], start_error=start_err)
+
+
+if __name__ == "__main__":
+    main()
