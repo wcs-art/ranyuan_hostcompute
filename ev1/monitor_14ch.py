@@ -244,7 +244,7 @@ class Monitor14(QtWidgets.QMainWindow):
         # 六位刻度（-104300）在默认宽度里会被裁掉首尾，放大页专门留够空间、写全原文数字
         self._big.getAxis('left').setStyle(tickTextWidth=86)
         self._big.getAxis('left').setStyle(showValues=True)
-        self._no_si_prefix(self._big)
+        self._style_axes(self._big)
         self._big_curve = self._big.plot(pen="y")
         self._big_tip = pg.TextItem("等待数据…", color="#909090", anchor=(0.5, 0.5))
         self._big_tip.setPos(self.win_s / 2.0, 0.0); self._big_tip.hide()
@@ -302,20 +302,31 @@ class Monitor14(QtWidgets.QMainWindow):
                 plot.setLabel('left', 'ΔHbO2·ΔHbR')
             else:
                 plot.setLabel('left', 'ΔHbO2/ΔHbR', units=self.fnirs_unit)
-        self._no_si_prefix(plot)
+        self._style_axes(plot)
 
     @staticmethod
-    def _no_si_prefix(plot):
-        """关掉 pyqtgraph 的 SI 前缀缩写，刻度上写多少就是多少。
+    def _style_axes(plot):
+        """轴颜色 + 关掉 pyqtgraph 的 SI 前缀缩写。
 
-        默认 autoSIPrefix=True 时，纵轴 -120300 会被画成 "-120"（内部乘以 0.001），
-        而"(x1000)"这个乘数只在 labelUnits 为空时才拼进轴标签；我们给轴设了
-        "原始值·单位待定"，于是乘数被静默丢掉 —— 现场看到的 -120 与终端里的
+        颜色：默认前景色是配置项 'd'（解析成 #969696 深灰），黑底上对比度很低。
+        显式给浅灰，不依赖 pyqtgraph 的全局配置。
+
+        注意：离屏渲染（QT_QPA_PLATFORM=offscreen，本机无字体）下 drawText 一个
+        像素都不出，连按钮文字都看不见 —— 所以"截图里轴上没有数字"不能当作
+        轴没画刻度的证据，验证刻度只能读 tickStrings / viewRange。
+
+        SI 前缀：默认 autoSIPrefix=True 时，纵轴 -120300 会被画成 "-120"（内部乘
+        0.001），而"(x1000)"这个乘数只在 labelUnits 为空时才拼进轴标签；我们给轴
+        设了"原始值·单位待定"，于是乘数被静默丢掉 —— 现场看到的 -120 与终端里的
         -120362.52 差 1000 倍，直接判成"数据不对"。宁可刻度长一点，也不能改写数值。
         """
         for name in ('left', 'bottom'):
             try:
-                plot.getAxis(name).enableAutoSIPrefix(False)
+                ax = plot.getAxis(name)
+                ax.enableAutoSIPrefix(False)
+                # 轴线和刻度文字分开设：setPen 只管轴线/刻度，不保证管文字
+                ax.setPen(pg.mkPen('#c8c8c8'))
+                ax.setTextPen(pg.mkPen('#e6e6e6'))
             except Exception:  # noqa: BLE001
                 pass
 
@@ -455,8 +466,8 @@ class Monitor14(QtWidgets.QMainWindow):
         except Exception:  # noqa: BLE001
             return None
 
-    def _auto_eeg_scale(self, seg):
-        """按实测峰峰值定半幅量程，只改显示范围，不改数据本身。
+    def _scale_of(self, seg) -> float:
+        """这一段数据需要的半幅量程（贴峰、抗毛刺、有下限）。取不到返回 0。
 
         三处必须注意：
         1) 用 (max-min)/2 而不是 max(|x|)：真实信号带直流偏置时（如原始码值在
@@ -473,13 +484,33 @@ class Monitor14(QtWidgets.QMainWindow):
                     spans.append(rs[1] * 2.0)     # 半幅 -> 峰峰
             peak = max(spans) / 2.0 if spans else 0.0
         except Exception:  # noqa: BLE001
-            return
+            return 0.0
         if not np.isfinite(peak) or peak <= 0:
-            return
+            return 0.0
         # 量程直接贴合峰值，不再按 1/2/5 取整：
         # 取整会让 126 的峰峰落到 100 档（只占 63%）甚至 200 档（31%），
         # 现场的原话就是"太紧凑，看不出波形浮动"。VOFA 的 Auto 也是贴极值。
-        want = max(peak * AUTO_PAD, AUTO_MIN_SCALE)
+        return max(peak * AUTO_PAD, AUTO_MIN_SCALE)
+
+    def _auto_eeg_scale(self, base_seg, view_seg=None):
+        """定纵轴半幅量程。base_seg = 基准段（最近一窗），view_seg = 当前视图段。
+
+        为什么要分成两段：纵轴是测量读数，横轴缩放只该改"看哪段时间"。
+        旧写法只拿可见段定量程 —— 从 5 s 放大到 0.2 s，可见段的峰峰值小 25 倍，
+        纵轴读数就跟着从 -122081~-118623 变成 -121654~-119770，同一条曲线在两种
+        缩放下列出两组数，现场会认为测量值本身在变（实测量程 3459 -> 1884）。
+
+        现在基准恒定取"最近一窗"，缩放不影响；只有当视图里的数据确实比基准大一截
+        （缩出去看更早的、幅度更大的历史）才抬高量程，避免削顶。只抬不压，
+        缩回来时基准接管，读数自动回到原值。
+        """
+        want = self._scale_of(base_seg)
+        if view_seg is not None:
+            need = self._scale_of(view_seg)
+            if need > want:
+                want = need
+        if want <= 0:
+            return
         # 回差收到 ±15%：贴合得紧，但不会每一帧都跟着噪声跳档
         if want > self.eeg_scale * AUTO_HYST or want < self.eeg_scale / AUTO_HYST:
             self.eeg_scale = want
@@ -894,6 +925,10 @@ class Monitor14(QtWidgets.QMainWindow):
                 c.setData([], [])
             for tip in self._tips:
                 tip.setText("等待数据…"); tip.show()
+            # 读数跟着一起收起来：曲线清空后视图范围还是上一帧的，
+            # 空图上留着一组六位数字，现场会当成"当前值"。
+            for i in range(self.n_total):
+                self._hide_ylabels(i)
             self._big_curve.setData([], [])
             self._big_tip.setText("等待数据…"); self._big_tip.show()
             return
@@ -933,27 +968,49 @@ class Monitor14(QtWidgets.QMainWindow):
                 i0_f, c_f = recv - 2, 2
         xe, seg_e = self._take(self.buf_eeg, i0_e, c_e, fe, recv)
         xf, seg_f = self._take(self.buf_fn, i0_f, c_f, ff, recv)
-        if seg_e is None or seg_f is None:
-            # 视图整段落在"还没有数据"的区间：不画线，也别留上一帧的残影
-            for c in self.curves + [self._big_curve]:
-                c.setData([], [])
-            return
         if self.eeg_scale_auto:
-            # 单通道放大时只按这一路定量程：放大就是要看这一路自己的细节，
-            # 拿 14 路里最大的那一路定档，小信号会被压成一条线（这正是上一版的问题）。
-            if self._solo is not None and self._solo < self.n_eeg:
-                self._auto_eeg_scale(seg_e[self._solo:self._solo + 1])
-            else:
-                self._auto_eeg_scale(seg_e)
+            # 量程基准固定取"最近一窗"，不看横轴缩放到哪里（详见 _auto_eeg_scale）。
+            # 单通道放大时只按这一路算：放大就是要看它自己的细节，拿 14 路里最大的
+            # 那一路定档，小信号会被压成一条线（这正是上一版的问题）。
+            cw = min(recv, max(2, int(self.win_s * fe)))
+            _, seg_base = self._take(self.buf_eeg, recv - cw, cw, fe, recv)
+            if seg_base is None:
+                seg_base = seg_e
+            if seg_base is not None:
+                view = seg_e
+                if self._solo is not None and self._solo < self.n_eeg:
+                    seg_base = seg_base[self._solo:self._solo + 1]
+                    view = None if view is None else view[self._solo:self._solo + 1]
+                self._auto_eeg_scale(seg_base, view)
+        if seg_e is None and seg_f is None:
+            # 两端都取不到才整屏清空。旧写法是"一边取不到就全清"：fNIRS 缓冲只
+            # 3000 点（500 Hz 下 6 s），缩到 6 s 以前那段时 seg_f 为 None，
+            # 于是 CH1 明明有 30 s 数据也被一起抹掉 —— 现场就是"放大以后数据没了"。
+            why = "超出缓冲（仅存最近 %.0f s）" % (self.buf_eeg.shape[1] / fe)
+            for i in range(self.n_total):
+                self._paint_missing(self.plots[i], self.curves[i], self._tips[i], i, why)
+            if self._solo is not None:
+                self._paint_missing(self._big, self._big_curve, self._big_tip,
+                                    self._solo, why)
+            return
         # 横轴：左边界由样本序号推出（累计模式会一路涨），14 个子图共用一把尺
         # （合同 S1「时间轴统一」）。只有跟随时才改范围，否则会抢掉用户的缩放。
         if self._follow:
             self._recalc_x_left()
             self._reset_x_range()
-        # 网格页的 14 张图
+        # 网格页的 14 张图。EEG / fNIRS 各画各的：一边的缓冲覆盖不到，只清这一边，
+        # 另一边的曲线照画（这就是上面说的"整屏消失"的修法）。
+        why_fn = "超出缓冲（仅存最近 %.0f s）" % (self.buf_fn.shape[1] / ff)
         for i in range(self.n_total):
             if i < self.n_eeg:
-                self._paint(self.plots[i], self.curves[i], self._tips[i], i, xe, seg_e[i])
+                if seg_e is None:
+                    self._paint_missing(self.plots[i], self.curves[i], self._tips[i], i,
+                                        "超出缓冲（仅存最近 %.0f s）"
+                                        % (self.buf_eeg.shape[1] / fe))
+                else:
+                    self._paint(self.plots[i], self.curves[i], self._tips[i], i, xe, seg_e[i])
+            elif seg_f is None:
+                self._paint_missing(self.plots[i], self.curves[i], self._tips[i], i, why_fn)
             else:
                 self._paint(self.plots[i], self.curves[i], self._tips[i], i, xf,
                             seg_f[i - self.n_eeg])
@@ -961,7 +1018,14 @@ class Monitor14(QtWidgets.QMainWindow):
         if self._solo is not None:
             i = self._solo
             if i < self.n_eeg:
-                self._paint(self._big, self._big_curve, self._big_tip, i, xe, seg_e[i])
+                if seg_e is None:
+                    self._paint_missing(self._big, self._big_curve, self._big_tip, i,
+                                        "超出缓冲（仅存最近 %.0f s）"
+                                        % (self.buf_eeg.shape[1] / fe))
+                else:
+                    self._paint(self._big, self._big_curve, self._big_tip, i, xe, seg_e[i])
+            elif seg_f is None:
+                self._paint_missing(self._big, self._big_curve, self._big_tip, i, why_fn)
             else:
                 self._paint(self._big, self._big_curve, self._big_tip, i, xf,
                             seg_f[i - self.n_eeg])
@@ -1054,6 +1118,22 @@ class Monitor14(QtWidgets.QMainWindow):
         tip.hide()
         curve.setData(x, y)
         self._fit_y(plot, i, y)
+
+    def _paint_missing(self, plot, curve, tip, i: int, why: str):
+        """这一路当前取不到数据：清线、写明原因、收起旧读数。
+
+        必须同时收起纵轴读数：曲线清空后视图范围还是上一帧的值，
+        图上就有"两个六位数字 + 一片空白"，现场读到的是一组对不上的数
+        （放大以后纵轴数值不对，就是这么来的）。
+        """
+        curve.setData([], [])
+        if not (self.ch_enable[i] and self._ch_ok[i]):
+            tip.setText("无数据（本链路未发送该通道）")
+        else:
+            tip.setText(why)
+        tip.show()
+        plot.setYRange(-1.0, 1.0, padding=0)
+        self._hide_ylabels(i)
 
     def _hide_ylabels(self, i: int):
         """没有数据的通道不显示纵轴读数，否则旧数字会留在空图上。"""

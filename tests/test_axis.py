@@ -511,3 +511,87 @@ def test_max_zoom_keeps_a_visible_window(mon):
     assert hi - lo >= monitor_14ch.MIN_SPAN_S - 1e-6, f"放到最大只剩 {hi - lo:.4f}s"
     n = len(mon.curves[0].getData()[0])
     assert n >= 50, f"放到最大只剩 {n} 个点，屏幕上等于没有"
+
+
+# ---- 2026-11-18 现场两点：缩放改读数 / 缩放后整屏消失 -------------------------
+def test_zoom_in_does_not_change_y_scale(mon):
+    """横向放大 50 倍，纵轴量程（上限-下限）必须一点不变。
+
+    [规格] 纵轴是幅度标尺；横轴缩放只该改"看哪段时间"。旧实现每帧拿可见段重算
+    量程，实测 5 s 窗口 ±1729（跨度 3459）、0.2 s 窗口 ±942（跨度 1884）——
+    同一条曲线在两种缩放下列出两组数，现场判断成"测量值在变 / 数值不对"。
+    """
+    np = pytest.importorskip("numpy")
+    mon.fs_eeg = mon.fs_fnirs = 500.0
+    t = np.arange(20000) / 500.0                      # 40 s
+    _push(mon, (-120362.0 + 45.0 * np.sin(2 * np.pi * 8.0 * t)).tolist())
+
+    spans = []
+    for w in (10.0, 5.0, 2.0, 1.0, 0.5, 0.2):
+        mon.plots[0].setXRange(40.0 - w, 40.0, padding=0)
+        mon._on_manual_zoom(0)
+        mon._tick(force=True)
+        spans.append(_yspan(mon))
+    assert max(spans) - min(spans) < 0.5, f"缩放过程中纵轴量程在变: {spans}"
+    # 90 的峰峰要占满屏高，不能被压平（这条是原来的行为，不许回退）
+    assert 90.0 / spans[-1] > 0.85, f"峰峰 90 只占 {90.0 / spans[-1]:.0%} 屏高"
+
+
+def test_short_fnirs_buffer_does_not_wipe_eeg(mon):
+    """fNIRS 缓冲只存 3000 点（500 Hz 下 6 s），缩到 15~25 s 时 CH1 必须照画。
+
+    [规格] 一条链路取不到数据，不许牵连另一条。旧写法 `if seg_e is None or
+    seg_f is None: 全清`：一缩到 6 s 以前那段，CH1 明明还有 30 s 数据，屏幕上
+    却一条线都没有 —— 现场就是"放大以后数据不见了"，而且不点「跟随最新」回不来。
+    """
+    mon.fs_eeg = mon.fs_fnirs = 500.0
+    _push(mon, [-120362.0 + (i % 7) for i in range(20000)])       # 40 s
+    mon.plots[0].setXRange(15.0, 25.0, padding=0)
+    mon._on_manual_zoom(0)
+    mon._tick(force=True)
+
+    assert _xrange(mon.plots[0]) == (15.0, 25.0)
+    assert _n_points(mon, 0) == 5000, f"缩到 15~25s 后 CH1 只剩 {_n_points(mon, 0)} 点"
+
+
+def test_y_reading_matches_the_view_after_zoom(mon):
+    """缩放后图上那两行读数必须等于当前视野上下限，不能是上一帧的残留。"""
+    mon.fs_eeg = mon.fs_fnirs = 500.0
+    _push(mon, [-120362.0 + (i % 7) for i in range(20000)])
+    mon.plots[0].setXRange(15.0, 25.0, padding=0)
+    mon._on_manual_zoom(0)
+    mon._tick(force=True)
+    lo, hi = mon.plots[0].getViewBox().viewRange()[1]
+    assert mon._ylbl_hi[0].text() == f"{hi:.0f}", \
+        f"上限读数 {mon._ylbl_hi[0].text()} != 视野 {hi:.0f}"
+    assert mon._ylbl_lo[0].text() == f"{lo:.0f}", \
+        f"下限读数 {mon._ylbl_lo[0].text()} != 视野 {lo:.0f}"
+
+
+def test_fnirs_out_of_buffer_says_so(mon):
+    """fNIRS 曲线画不出来时，提示要写明"超出缓冲"，而不是假装这一路没数据。"""
+    mon.fs_eeg = mon.fs_fnirs = 500.0
+    raw = [1000.0 + (i % 5) for i in range(20)]
+    for i in range(200):                       # 前 200 帧带真光强 -> fNIRS 通道算"有数据"
+        mon.push_frame(seq=i + 1, eeg_uv=[-120362.0, 0, 0, 0], hbo=[0.0] * 10,
+                       hbr=[0.0] * 10, raw=raw, eeg_n=1)
+    for i in range(200, 20000):
+        mon.push_frame(seq=i + 1, eeg_uv=[-120362.0, 0, 0, 0], hbo=[0.0] * 10,
+                       hbr=[0.0] * 10, raw=None, eeg_n=1)
+    mon._tick(force=True)
+    mon.plots[0].setXRange(15.0, 25.0, padding=0)
+    mon._on_manual_zoom(0)
+    mon._tick(force=True)
+    assert _n_points(mon, 0) > 0, "EEG 不该被 fNIRS 的缓冲长度拖死"
+    assert _n_points(mon, mon.n_eeg) == 0
+    assert "超出缓冲" in mon._tips[mon.n_eeg].toPlainText(), \
+        f"fNIRS 提示不对: {mon._tips[mon.n_eeg].toPlainText()}"
+
+
+def test_stale_labels_are_hidden_when_board_stops(mon):
+    """停发后空图上不许留着上一帧的纵轴读数，否则现场把它当当前值读。"""
+    _push(mon, [-120362.0 + (i % 7) for i in range(300)])
+    assert not mon._ylbl_hi[0].isHidden(), "有数据时读数该显示"
+    mon._t_rx = time.time() - 5.0
+    mon._tick()
+    assert mon._ylbl_hi[0].isHidden() and mon._ylbl_lo[0].isHidden()
