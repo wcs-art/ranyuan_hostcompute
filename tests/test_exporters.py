@@ -8,6 +8,7 @@
 """
 from __future__ import annotations
 
+import csv
 import math
 
 import pytest
@@ -112,3 +113,14 @@ def test_csv_row_accepts_nested_intensity(tmp_path):
     row = contract.frame_to_row(fr, optional=True)
     assert len(row) == len(w.header)
     w.close()
+
+
+# 5 -----------------------------------------------------------------------
+def test_fs_from_time_ignores_batch_write_timestamps():
+    """[规格, 台账 M1/P13] 批量写盘的台阶时间戳不能把 500 Hz 算成几千 Hz。"""
+    from exporters import _fs_from_time
+
+    # 40 ms 定时器一拍取 8 帧：批内时间戳相同，批间才差 40 ms
+    t = [round(k * 0.04, 6) for k in range(20) for _ in range(8)]
+    cols = {"timestamp_s": t}
+    got = _fs_from_time(cols, 

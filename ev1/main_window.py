@@ -471,7 +471,8 @@ class ClassicMainWindow(QtWidgets.QMainWindow):
         fl = QtWidgets.QVBoxLayout(dlg)
         fl.addWidget(QtWidgets.QLabel(f"源: {Path(src).name}"))
         cks = {}
-        for fmt, tip in [("EDF", "EDFbrowser可读"), ("SNIRF", "Homer3可读"), ("XDF", "pyxdf/MoBI可读")]:
+        for fmt, tip in [("EDF", "EDFbrowser可读"), ("BDF", "24bit欧洲格式"),
+                         ("SNIRF", "Homer3可读"), ("XDF", "pyxdf/MoBI可读")]:
             c = QtWidgets.QCheckBox(f"{fmt} ({tip})"); c.setChecked(True)
             cks[fmt] = c; fl.addWidget(c)
         row = QtWidgets.QHBoxLayout()

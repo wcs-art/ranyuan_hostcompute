@@ -30,19 +30,23 @@ def write_xdf(path: str | Path, streams: dict, clock_offsets: dict | None = None
     out = Path(path); out.parent.mkdir(parents=True, exist_ok=True)
     buf = bytearray(b"XDF:")
     buf += _chunk(1, None, _HDR.encode())
-    for sid, (name, (data, fs, stype)) in enumerate(streams.items(), start=1):
+    for sid, (name, val) in enumerate(streams.items(), start=1):
+        data, fs, stype = val[:3]
+        # 第 4 位是调用方给的真实起始时间戳(s)。没有就明确用合成时间戳，
+        # 不能再把 1000+sid 当成"设备时间"——下游拿它对齐会整体错开。
+        ts0 = float(val[3]) if len(val) > 3 else 1000.0 + sid
         data = np.asarray(data, dtype=np.float32)
         nch, n = data.shape
         labels = [f"ch{i+1}" for i in range(nch)]
         buf += _chunk(2, sid, _stream_xml(name, stype, nch, fs, "float32", labels))
-        ts0 = 1000.0 + sid  # LSL风格时间戳(s); 真机用pylsl.local_clock()
         step = 1.0/fs if fs > 0 else 0.02
         samp = bytearray(_varlen(n))
         for k in range(n):
             samp += b"\x01" + struct.pack("<d", ts0 + k*step)
             samp += data[:, k].astype("<f4").tobytes()
         buf += _chunk(3, sid, bytes(samp))
-        for t, off in (clock_offsets or {}).get(name, [(ts0, 0.0)]):
+        # 只有调用方真的给了校正信息才写 tag=4；静默写 0 等于谎报"已对时"。
+        for t, off in (clock_offsets or {}).get(name, []):
             buf += _chunk(4, sid, struct.pack("<dd", t, off))
         foot = (f'<?xml version="1.0"?><info><first_timestamp>{ts0}</first_timestamp>'
                 f"<last_timestamp>{ts0+(n-1)*step}</last_timestamp><sample_count>{n}</sample_count></info>").encode()

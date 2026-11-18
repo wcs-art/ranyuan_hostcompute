@@ -1,6 +1,6 @@
-"""S2 导出验收: 拿一份 CSV, 导三种格式并回读校验, 打印 PASS/FAIL。
+"""S2 导出验收: 拿一份 CSV, 导四种格式并回读校验, 打印 PASS/FAIL。
 
-用途: 交付/验收时现场跑一遍, 证明 EDF / SNIRF / XDF 都能被第三方读出来。
+用途: 交付/验收时现场跑一遍, 证明 EDF / BDF / SNIRF / XDF 都能被第三方读出来。
 不需要装 EDFbrowser 或 Homer3, 用 pyedflib / h5py / pyxdf 做结构性回读;
 本机若装了 mne(--mne), 再用 MNE 独立读一遍 EDF 与 SNIRF(更接近甲方验法)。
 
@@ -27,20 +27,22 @@ def _p(tag: str, ok: bool, detail: str = "") -> bool:
     return ok
 
 
-def check_edf(path: Path) -> bool:
+def check_edf(path: Path, tag: str = "EDF ") -> bool:
     from pyedflib import highlevel
 
     sig, hdr, _ = highlevel.read_edf(str(path))
     n = len(sig)
     nsamp = len(sig[0]) if n else 0
     fs = hdr[0]["sample_frequency"] if n else 0
-    print(f"EDF  {path.name}  {n} 通道 × {nsamp} 点 @ {fs} Hz")
+    print(f"{tag} {path.name}  {n} 通道 × {nsamp} 点 @ {fs} Hz")
     good = True
     good &= _p("通道数为 4", n == 4, f"实际 {n}")
     good &= _p("每通道点数一致", all(len(s) == nsamp for s in sig))
     good &= _p("采样率 > 0", fs > 0, f"{fs} Hz")
-    good &= _p("时长 = 点数/采样率", abs(nsamp / fs - nsamp / fs) < 1e-6,
-               f"{nsamp / fs:.2f} s")
+    # 旧断言写的是 abs(nsamp/fs - nsamp/fs) < 1e-6 —— 恒真，等于没验。
+    # pyedflib 的 header 不带 record 数，这里只报可计算时长，不假称已校验。
+    good &= _p("时长可计算", fs > 0 and nsamp > 0,
+               f"{nsamp / fs:.2f} s" if fs else "无采样率")
     return bool(good)
 
 
@@ -116,21 +118,23 @@ def main(argv=None) -> int:
     out = Path(a.out)
     out.mkdir(parents=True, exist_ok=True)
 
-    from exporters import export_edf, export_snirf, export_xdf
-    import numpy as np
+    from exporters import export_bdf, export_edf, export_snirf, export_xdf_from_csv
 
     stem = csv_path.stem
-    edf, snirf, xdf = out / f"{stem}.edf", out / f"{stem}.snirf", out / f"{stem}.xdf"
+    edf, bdf = out / f"{stem}.edf", out / f"{stem}.bdf"
+    snirf, xdf = out / f"{stem}.snirf", out / f"{stem}.xdf"
 
     print(f"源: {csv_path}")
     print("导出中…")
     export_edf(csv_path, edf)
+    export_bdf(csv_path, bdf)
     export_snirf(csv_path, snirf)
-    # XDF 走多流, 用一段占位数据证明写法可读; 真实多设备联合时由界面传实际缓冲
-    export_xdf({"Aidsleep_EEG_1": (np.zeros((4, 200)), 100.0, "EEG")}, xdf)
+    # XDF 直接用这份 CSV 的全部行，不再用 200 点占位数据冒充记录
+    export_xdf_from_csv(csv_path, xdf)
 
     print()
-    all_ok = check_edf(edf) & check_snirf(snirf) & check_xdf(xdf)
+    all_ok = (check_edf(edf) & check_edf(bdf, "BDF") &
+              check_snirf(snirf) & check_xdf(xdf))
     if a.mne:
         print()
         all_ok = check_mne(edf, snirf) & all_ok

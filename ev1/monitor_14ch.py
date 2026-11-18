@@ -6,6 +6,7 @@ import pyqtgraph as pg
 
 import contract   # _rec_row 依赖它; 缺失时 NameError 会被 _tick 的 except 吞掉,
                   # 表现为"点开始记录后一行都写不出来, 界面却毫无提示"。
+from derive import default_params as _derive_default_params  # 光学系数唯一出处
 
 N_EEG = 4; N_FNIRS = 10
 
@@ -62,13 +63,8 @@ class Monitor14(QtWidgets.QMainWindow):
         # 采样率初值，接上设备后由实测帧率覆盖
         self.fs_measured = 0.0
         self._fs_snapped = False
-        self.lux_per_lsb = 1.0   # 光强换算系数: 待标定, 改这里即可整体缩放
-        # 光强换算系数统一从 derive 取，不在界面另写一份
-        try:
-            from derive import default_params
-            self.lux_per_lsb = float(default_params().lux_per_lsb)
-        except Exception:
-            pass
+        # 光强换算系数只从 derive.FnirsOpticalParams 取一次；文献/定标值到了只改那一处。
+        self.lux_per_lsb = float(_derive_default_params().lux_per_lsb)
         self._last_od = None     # 最近一帧的 20 路 ΔOD, 有则写入 CSV 的 OD 列
         # 前 n_baseline 帧建基线 I0，之后逐帧做 MBLL
         self.n_baseline = 200          # 200 帧 @100Hz = 2 s 基线窗
@@ -98,6 +94,12 @@ class Monitor14(QtWidgets.QMainWindow):
         # 若照画就会得到一条贴 0 的假平线, 现场会当成"信号一直是 0"。
         self._ch_ok = [False]*self.n_total
         self._t_rx = None            # 最近一次收到帧的时刻, 用于判断"停发"
+        # CSV 的 timestamp_s 必须是**采样时刻**，不是写盘挂钟。
+        # 40 ms 定时器一拍取多帧时, 写盘时刻会挤在 1 ms 内, 采样率反推错 2~4.5 倍。
+        # 优先用设备时间戳；没有设备时间就用"帧序号 / 当前采样率"合成等间隔时间。
+        self._t_synth = 0.0
+        self._t_sampling = 0.0
+        self._t_sampling0 = None     # 本次记录的第 1 帧采样时刻, 写 CSV 时归零
         cw = QtWidgets.QWidget(); self.setCentralWidget(cw); lay = QtWidgets.QVBoxLayout(cw)
         bar = QtWidgets.QHBoxLayout()
         self.btn_pause = QtWidgets.QPushButton("暂停"); self.btn_pause.setCheckable(True)
@@ -286,6 +288,8 @@ class Monitor14(QtWidgets.QMainWindow):
         self.buf_raw = np.zeros((20, int(self.fs_fnirs*30)))
         self.battery_pct = -1.0
         self.eeg_quality = ["--"]*self.n_eeg; self.fnirs_quality = ["--"]*10
+        self._fnirs_levels = []          # S3: 每通道(最小,中位,最大)光强，暗噪声基线显示用
+        self._quality_error = ""         # 计算失败必须可见，不许静默 pass
         self.timer = QtCore.QTimer(); self.timer.timeout.connect(self._tick); self.timer.start(40)
         self._seq_last = -1; self._lost = 0; self._recv = 0; self._sim_seq = 0
         self._writer = None; self._csv_path = None; self._n_saved = 0
@@ -572,7 +576,7 @@ class Monitor14(QtWidgets.QMainWindow):
                 self._csv_path,
                 header=contract.csv_header(optional=True, extra=self.extra_cols),
             )
-            self._n_saved = 0; self._t0 = time.time()
+            self._n_saved = 0; self._t0 = time.time(); self._t_sampling0 = None
             self.btn_record.setText("■ 停止记录")
             self.btn_export.setEnabled(False)
             self.lbl_store.setText(f"● 记录中: records/{self._csv_path.name}")
@@ -591,7 +595,8 @@ class Monitor14(QtWidgets.QMainWindow):
             self.lbl_store.setText(f"已保存 {self._n_saved} 行 ({el:.0f}s) → {self._csv_path.name}")
     def _export_all(self, only=None, out_dir=None, _checked=False):
         from pathlib import Path
-        from exporters import export_edf, export_snirf, export_xdf
+        from exporters import (export_edf, export_bdf, export_snirf,
+                               export_xdf_from_csv)
         if self._csv_path is None:
             self.lbl_store.setText("请先记录CSV再导出")
             return
@@ -602,8 +607,8 @@ class Monitor14(QtWidgets.QMainWindow):
             fl = QtWidgets.QVBoxLayout(dlg)
             fl.addWidget(QtWidgets.QLabel(f"源: {Path(self._csv_path).name}"))
             cks = {}
-            for fmt, tip in [("EDF", "EDFbrowser可读"), ("SNIRF", "Homer3可读"),
-                             ("XDF", "pyxdf/MoBI可读")]:
+            for fmt, tip in [("EDF", "EDFbrowser可读"), ("BDF", "24bit欧洲格式"),
+                             ("SNIRF", "Homer3可读"), ("XDF", "pyxdf/MoBI可读")]:
                 c = QtWidgets.QCheckBox(f"{fmt} ({tip})")
                 c.setChecked(True)
                 cks[fmt] = c
@@ -637,31 +642,35 @@ class Monitor14(QtWidgets.QMainWindow):
                 export_edf(self._csv_path, base + ".edf", fs_eeg=self.fs_eeg)
                 parts.append("EDF[OK]")
             except Exception as e: parts.append(f"EDF跳过({e})")
+        if "BDF" in want:
+            try:
+                export_bdf(self._csv_path, base + ".bdf", fs_eeg=self.fs_eeg)
+                parts.append("BDF[OK]")
+            except Exception as e: parts.append(f"BDF跳过({e})")
         if "SNIRF" in want:
             try:
-                export_snirf(self._csv_path, base + ".snirf"); parts.append("SNIRF[OK]")
+                export_snirf(self._csv_path, base + ".snirf", fs_eeg=self.fs_eeg)
+                parts.append("SNIRF[OK]")
             except Exception as e: parts.append(f"SNIRF跳过({e})")
         if "XDF" in want:
             try:
-                n = min(2000, self.buf_eeg.shape[1])
-                streams = {"Aidsleep_EEG_1": (self.buf_eeg[:, -n:], self.fs_eeg, "EEG"),
-                            "Aidsleep_fNIRS_1": (self.buf_fn, self.fs_fnirs, "fNIRS")}
-                if hasattr(self, "buf_imu"):
-                    m = min(2000, self.buf_imu.shape[1])
-                    streams["Aidsleep_IMU_1"] = (self.buf_imu[:, -m:], 100.0, "IMU")
-                if hasattr(self, "buf_met"):
-                    k = min(600, self.buf_met.shape[1])
-                    streams["Aidsleep_Metrics_1"] = (self.buf_met[:, -k:], 1.0, "Metrics")
-                export_xdf(streams, base + ".xdf")
+                # 必须从已记录的 CSV 导出：旧代码拿界面缓冲的最后 2000 点，
+                # 导出的 XDF 与这份 CSV 不是同一段数据，甲方对不上。
+                export_xdf_from_csv(self._csv_path, base + ".xdf", fs_eeg=self.fs_eeg)
                 parts.append("XDF[OK]")
             except Exception as e: parts.append(f"XDF跳过({e})")
         self.lbl_store.setText(" ".join(parts))
     def _rec_row(self, seq, eeg_uv, hbo, hbr, acc_xyz=None, gyro_xyz=None,
                  raw=None, battery=-1.0, ts_abs_ms=0, event_type=0, event_ts=0,
-                 device_id=None):
+                 device_id=None, t_sample=None):
         """写一行 CSV：先组装成 Frame 再交给契约转行，表头和行同源，不会错位。"""
         if self._writer is None: return
-        t = time.time()-self._t0
+        # timestamp_s = 采样时刻（相对本次记录起点）。绝不用 time.time()：
+        # 批量取帧时一批帧的写盘时刻相同，导出 EDF 会把采样率算成几千 Hz。
+        if self._t_sampling0 is None:
+            self._t_sampling0 = self._t_sampling if t_sample is None else t_sample
+        t = (time.time() - self._t0 if t_sample is None
+             else max(0.0, t_sample - self._t_sampling0))
         n_inten = contract.N_FNIRS*len(contract.FNIRS_WLS)
         raw20 = [float(v) for v in (raw or [])][:n_inten]
         raw20 += [0.0]*(n_inten-len(raw20))
@@ -730,8 +739,19 @@ class Monitor14(QtWidgets.QMainWindow):
         return "正常"
 
     def push_frame(self, seq, eeg_uv, hbo, hbr, raw=None, battery=-1.0, acc_xyz=None, gyro_xyz=None,
-                   ts_abs_ms=0, event_type=0, event_ts=0, device_id=1, eeg_n=None):
+                   ts_abs_ms=0, event_type=0, event_ts=0, device_id=1, eeg_n=None, t_dev_ms=None):
         self._t_rx = time.time()
+        # 采样时刻：设备单调毫秒 > 设备绝对毫秒 > 本地等间隔合成。
+        # 设备复位会让单调毫秒跳变，回退到合成时间，绝不在 CSV 里留下倒退的时间轴。
+        self._t_synth += 1.0 / max(1.0, float(self.fs_eeg))
+        # t_dev_ms=0 是合法的设备上电第 0 ms，不能用真值判断当作"没提供"
+        t_sample = (float(t_dev_ms) / 1000.0 if t_dev_ms is not None else
+                    (float(ts_abs_ms) / 1000.0 if ts_abs_ms and ts_abs_ms > 0
+                     else self._t_synth))
+        if t_sample + 1.0 < getattr(self, "_t_sampling_prev", -1e18):
+            t_sample = self._t_synth
+        self._t_sampling_prev = t_sample
+        self._t_sampling = t_sample
         # eeg_n 是"本帧实际带了几路 EEG"。文本链路每行只有 1 个数时传 1,
         # 其余 3 路是补 0 的占位, 不能当数据画出来。
         n_ok = self.n_eeg if eeg_n is None else max(0, min(int(eeg_n), self.n_eeg))
@@ -776,7 +796,8 @@ class Monitor14(QtWidgets.QMainWindow):
                 try: self.motion_panel.push(np.array(ax), np.array(gx))
                 except Exception: pass
         self._rec_row(seq, eeg_uv, hbo, hbr, acc_xyz, gyro_xyz, raw=raw, battery=battery,
-                      ts_abs_ms=ts_abs_ms, event_type=event_type, event_ts=event_ts)
+                      ts_abs_ms=ts_abs_ms, event_type=event_type, event_ts=event_ts,
+                      t_sample=t_sample)
         # S9: 全部由现有EEG/fNIRS算出, ≥1Hz刷新 (每25帧≈1Hz), 推面板+存CSV/XDF
         try:
             if not hasattr(self, "_sm"):
@@ -808,7 +829,7 @@ class Monitor14(QtWidgets.QMainWindow):
             except Exception:
                 pass
         if self._recv % 25 == 0:
-            from quality import eeg_contact, fnirs_flags
+            from quality import eeg_contact, fnirs_flags, fnirs_levels
             try:
                 self.eeg_quality = eeg_contact(self.buf_eeg[:, -500:])
                 # buf_raw 是 20 行(10 通道 × 2 波长), 而 S3 判的是 10 个通道 ——
@@ -817,7 +838,13 @@ class Monitor14(QtWidgets.QMainWindow):
                 if r.shape[0] == contract.N_FNIRS * len(contract.FNIRS_WLS):
                     r = r.reshape(contract.N_FNIRS, len(contract.FNIRS_WLS), -1).mean(axis=1)
                 self.fnirs_quality = fnirs_flags(r)
-            except Exception: pass
+                # S3 终版要求"暗噪声基线显示"：函数早就在 quality.py 里，之前没人调用。
+                self._fnirs_levels = fnirs_levels(r)
+                self._quality_error = ""
+            except Exception as e:
+                self._quality_err_n = getattr(self, "_quality_err_n", 0) + 1
+                self._quality_error = (f"质量计算异常 x{self._quality_err_n}: "
+                                       f"{type(e).__name__}: {e}")
             self._refresh_status()
 
     def _refresh_status(self):
@@ -863,7 +890,18 @@ class Monitor14(QtWidgets.QMainWindow):
             fs = f"正常 {len(self.fnirs_quality) - len(bad)}/{len(self.fnirs_quality)} | {fs}"
         else:
             fs = f'<span style="color:{c["正常"]}">全部正常 {len(self.fnirs_quality)}/{len(self.fnirs_quality)}</span>'
-        self.lbl_quality.setText(f"<b>EEG</b> {eeg} &nbsp;|&nbsp; <b>fNIRS</b> {fs}")
+        line = f"<b>EEG</b> {eeg} &nbsp;|&nbsp; <b>fNIRS</b> {fs}"
+        if self._quality_error:
+            self.lbl_quality.setText(line + f"<br><span style='color:#c62828'>{self._quality_error}</span>")
+            return
+        # S3: 暗噪声基线（每通道中位光强）。系数未标定时就是原始码值，
+        # 明确写出当前系数，不能让现场把 1.0 的占位值当 lux 读。
+        if self._fnirs_levels:
+            med = " ".join(f"{i+1}:{v[1]*self.lux_per_lsb:.0f}"
+                           for i, v in enumerate(self._fnirs_levels))
+            line += (f"<br><span style='color:#8e8e8e'>暗噪声基线(中位, "
+                     f"系数={self.lux_per_lsb:g}待标定): {med}</span>")
+        self.lbl_quality.setText(line)
 
     def reset_buffers(self):
         """换数据源前清空波形与分析状态，避免上一条链路的旧数据混进新曲线。"""
@@ -884,6 +922,7 @@ class Monitor14(QtWidgets.QMainWindow):
         self._t_rx = None
         self.eeg_quality = ["--"] * self.n_eeg
         self.fnirs_quality = ["--"] * 10
+        self._fnirs_levels = []
 
     def detach_receiver(self):
         """断开数据源：之后不再产生任何数据（不造数）。"""

@@ -18,6 +18,7 @@ QtWidgets = pytest.importorskip("PyQt5.QtWidgets")
 pytest.importorskip("pyqtgraph")
 
 import contract  # noqa: E402
+import monitor_14ch  # noqa: E402
 
 
 @pytest.fixture(scope="module")
@@ -131,3 +132,60 @@ def test_seq_backward_is_reset_not_mass_loss(app):
         w.push_frame(s, [0.0] * 4, [0.0] * 10, [0.0] * 10, raw=[1000.0] * 20)
     assert w._lost == 0, f"复位被算成丢包 {w._lost}"
     assert w._seq_resets == 1
+
+
+# 6 -----------------------------------------------------------------------
+def test_csv_timestamp_is_sampling_time_even_when_pushed_in_a_burst(app, tmp_path, monkeypatch):
+    """[规格, 台账 M1/P13] 批量取帧时 timestamp_s 必须等间隔，不能挤在同一毫秒。
+
+    旧写法 t = time.time()-_t0：300 帧在 tight loop 里 60 ms 写完，
+    导出 _fs_from_time 算出 3642 Hz，EDF/SNIRF 时间轴全错。
+    """
+    w = _monitor(app)
+    monkeypatch.chdir(tmp_path)
+    w.btn_record.setChecked(True)
+    for i in range(300):
+        w.push_frame(i + 1, [10.0] * 4, [0.0] * 10, [0.0] * 10,
+                     raw=[1000.0] * 20)
+    w.btn_record.setChecked(False)
+    rows = list(csv.DictReader(open(w._csv_path, encoding="utf-8-sig")))
+    t = [float(r["timestamp_s"]) for r in rows]
+    dt = [b - a for a, b in zip(t, t[1:])]
+    assert len(set(round(d, 6) for d in dt)) == 1, f"时间戳不是等间隔: {dt[:6]}"
+    assert dt[0] == pytest.approx(1.0 / w.fs_eeg, rel=1e-3)
+
+    # 设备给了单调毫秒时优先用它，不受界面 fs 估计影响
+    w2 = _monitor(app)
+    monkeypatch.chdir(tmp_path)
+    w2.btn_record.setChecked(True)
+    for i in range(100):
+        w2.push_frame(i + 1, [10.0] * 4, [0.0] * 10, [0.0] * 10,
+                      raw=[1000.0] * 20, t_dev_ms=i * 4)
+    w2.btn_record.setChecked(False)
+    t2 = [float(r["timestamp_s"]) for r in
+          csv.DictReader(open(w2._csv_path, encoding="utf-8-sig"))]
+    assert t2[1] - t2[0] == pytest.approx(0.004, abs=1e-6)
+
+
+def test_quality_panel_shows_dark_noise_baseline(app):
+    """[规格, S3] fnirs_levels 之前是死代码；暗噪声基线必须真的显示在界面上。"""
+    w = _monitor(app)
+    for i in range(100):
+        w.push_frame(i + 1, [10.0] * 4, [0.0] * 10, [0.0] * 10,
+                     raw=[1000.0 + i % 5 for _ in range(20)])
+    assert len(w._fnirs_levels) == 10
+    text = w.lbl_quality.text()
+    assert "暗噪声基线" in text, f"界面上没有基线读数: {text[:200]}"
+    assert "系数=1待标定" in text, "定标系数是占位值，必须显式提示"
+
+
+def test_lux_coefficient_has_single_source(app):
+    """[工程约束] 光学系数只在 derive.FnirsOpticalParams 定义一次。"""
+    from pathlib import Path
+
+    from derive import default_params
+
+    w = _monitor(app)
+    assert w.lux_per_lsb == default_params().lux_per_lsb
+    src = Path(monitor_14ch.__file__).read_text(encoding="utf-8")
+    assert "lux_per_lsb = 1.0" not in src, "monitor_14ch 里又写了一份系数"

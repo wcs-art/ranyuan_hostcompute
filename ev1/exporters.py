@@ -37,57 +37,79 @@ def _read_csv_columns(csv_path: str | Path) -> dict[str, list[float]]:
     return cols
 
 
-def _fs_from_time(cols: dict) -> float:
-    """从 timestamp_s 反推采样率(取相邻间隔中位数)。
+def _fs_from_time(cols: dict, fs_eeg: float | None = None) -> float:
+    """从 timestamp_s 反推采样率：用**总跨度**，绝不用相邻间隔中位数。
 
-    为什么不用调用方传的值: 界面里的 fs_eeg 是实测帧率的平滑值, 换链路/换固件
-    帧率会变; 而 CSV 里的时间戳是"这行到底什么时候录的"。EDF 的采样率一旦写错,
-    EDFbrowser 里的时间轴就整体缩放 N 倍, 甲方一验就发现对不上。
+    台账 M1/P13 的实测：40 ms 定时器每拍批量取 8~20 帧，写盘时刻几乎相同，
+    批内相邻间隔 ≈ 单帧处理耗时(1 ms)，批间才有 40 ms；中位数被批内值主导，
+    500 fps 的记录算出 996~2237 Hz，EDF 时间轴被压缩 2~4.5 倍。
+    跨度法 (n-1)/(t末-t首) 对批内台阶免疫，只认整段记录的平均节奏。
+
+    非单调时间戳（对时跳变/回放乱序）不猜采样率，返回 0 让调用方用显式 fs 兜底。
     """
-    import statistics
-
     t = cols.get("timestamp_s") or []
     if len(t) < 3:
         return 0.0
-    dt = [b - a for a, b in zip(t, t[1:]) if b > a]
-    if not dt:
+    if any(b < a for a, b in zip(t, t[1:])):
         return 0.0
-    med = statistics.median(dt)
-    return round(1.0 / med, 3) if med > 0 else 0.0
+    gaps = [b - a for a, b in zip(t, t[1:])]
+    span = float(t[-1]) - float(t[0])
+    if span <= 0:
+        return 0.0
+    fs = (len(t) - 1) / span
+    # 超过半数相邻时间戳相同 = 批量写盘。跨度法在"均匀分批"时仍可用，
+    # 在乱速回放时会算出几千 Hz；用调用方实测帧率做合理性闸门。
+    if sum(1 for g in gaps if g == 0) > len(gaps) / 2:
+        if fs_eeg and 0.5 <= fs / float(fs_eeg) <= 2.0:
+            return round(fs, 3)
+        return 0.0
+    return round(fs, 3)
 
 
-def export_edf(csv_path: str | Path, out_path: str | Path, fs_eeg: float | None = None):
-    """CSV -> EDF, 需 pyedflib; 第三方可用 EDFbrowser / MNE 打开验证。
+def _time_from_cols(cols: dict, fs: float):
+    """SNIRF/XDF 的时间向量。正常用记录时间戳；旧记录的"台阶"用等间隔重建。
 
-    两个曾经的坑:
-      1. 采样率写死 500 —— 录的是 100 Hz 就整体压缩 5 倍。现在优先用
-         timestamp_s 反推, 传进来的 fs_eeg 只在没有时间戳时兜底。
-      2. physical_min/max 写死 ±500 µV —— 睡眠记录里翻身/咬牙轻松过千微伏,
-         pyedflib 的 write_edf 直接 assert 失败, 界面上表现为"EDF跳过",
-         等于真实数据一条都导不出来。现在按各通道实际幅值自适应量程。
+    台阶判据：相邻间隔最大值 > 4×中位数。批量写盘的记录里批内 1 ms、批间 40 ms，
+    比值 40，一眼就能识别；真实丢包只跳过个别间隔，不会整段呈两种节奏。
     """
+    import numpy as np
+
+    t = np.asarray(cols.get("timestamp_s") or [], dtype=np.float64)
+    if t.size == 0:
+        return t
+    if fs <= 0 or t.size < 3:
+        return t - t[0]
+    dt = np.diff(t)
+    pos = dt[dt > 0]
+    duplicated = float((dt == 0).sum()) / max(1, dt.size) > 0.5
+    stepped = bool(pos.size) and float(np.max(pos)) > 4.0 * float(np.median(pos))
+    if duplicated or stepped:
+        print(f"[时间轴] 时间戳含批量写盘台阶/重复值，SNIRF/XDF 改用等间隔 {fs:g} Hz")
+        return np.arange(t.size, dtype=np.float64) / fs
+    return t - t[0]
+
+
+def _eeg_signals(cols: dict, fs_eeg: float | None):
+    """CSV -> (4 路信号, 采样率, 信号头)。EDF/BDF 共用，避免两份格式参数走偏。"""
     import math
 
     import numpy as np
     from pyedflib import highlevel
 
-    cols = _read_csv_columns(csv_path)
     eeg_cols = [f"eeg{i+1}_uv" for i in range(4)]
     missing = [c for c in eeg_cols if c not in cols]
     if missing:
         raise KeyError(f"CSV 缺少 EEG 列: {missing}")
-
     sigs = [np.asarray(cols[c], dtype=float) for c in eeg_cols]
     if not sigs[0].size:
         raise ValueError("CSV 里没有数据行")
 
-    fs = _fs_from_time(cols)
+    fs = _fs_from_time(cols, fs_eeg)
     if fs <= 0:
         fs = float(fs_eeg or 500.0)
     elif fs_eeg and abs(fs - fs_eeg) / fs > 0.05:
-        print(f"[EDF] 采样率按时间戳取 {fs} Hz, 调用方传的是 {fs_eeg} Hz; 以时间戳为准")
+        print(f"[EDF/BDF] 采样率按时间戳跨度取 {fs} Hz, 调用方传的是 {fs_eeg} Hz; 以时间戳为准")
 
-    hdr = highlevel.make_header(patientname="aidsleep")
     chs = []
     for i, s in enumerate(sigs):
         peak = float(np.max(np.abs(s))) if s.size else 0.0
@@ -98,8 +120,50 @@ def export_edf(csv_path: str | Path, out_path: str | Path, fs_eeg: float | None 
             physical_min=-lim, physical_max=lim,
             digital_min=-32768, digital_max=32767,
         ))
-    highlevel.write_edf(str(out_path), sigs, chs, hdr)
+    return sigs, fs, chs
+
+
+def _write_edf_family(csv_path, out_path, fs_eeg, file_type: int):
+    """EDF/BDF 共用的低层写出：显式控制 record 长度，避免尾部补点。
+
+    pyedflib 默认 1 s/record，300 点 @200Hz 会被补成 400 点，
+    第三方工具里时长多出 0.5 s。按 gcd(n, fs) 定每 record 样本数即可整除。
+    """
+    import math
+
+    import pyedflib
+    from pyedflib import highlevel
+
+    cols = _read_csv_columns(csv_path)
+    sigs, fs, chs = _eeg_signals(cols, fs_eeg)
+    n = len(sigs[0])
+    spr = math.gcd(n, max(1, round(fs)))
+    with pyedflib.EdfWriter(str(out_path), n_channels=len(sigs),
+                            file_type=file_type) as w:
+        w.setDatarecordDuration(float(spr) / fs)
+        w.setSignalHeaders(chs)
+        w.setHeader(highlevel.make_header(patientname="aidsleep"))
+        w.writeSamples(sigs)
     return out_path
+
+
+def export_edf(csv_path: str | Path, out_path: str | Path, fs_eeg: float | None = None):
+    """CSV -> EDF，第三方可用 EDFbrowser / MNE 打开验证。"""
+    import pyedflib
+    return _write_edf_family(csv_path, out_path, fs_eeg, pyedflib.FILETYPE_EDF)
+
+
+def export_bdf(csv_path: str | Path, out_path: str | Path, fs_eeg: float | None = None):
+    """CSV -> BDF（24-bit EEG 欧洲数据格式），合同 S2 ②要求 EDF/BDF 两种格式。
+
+    必须手写 EdfWriter 而不是 highlevel.write_edf(file_type=BDF)：
+    pyedflib 默认 1 s 一个 data record，300 点 @200Hz 会被补成 400 点，
+    Homer/EDFbrowser 读到的时长比真实记录多 0.5 s。这里按样本数选 record 长度，
+    使 记录数 × 每记录样本数 == 真实样本数，一点不多一点不少。
+    """
+    import pyedflib
+
+    return _write_edf_family(csv_path, out_path, fs_eeg, pyedflib.FILETYPE_BDF)
 
 def _resolve_fnirs_columns(cols: dict) -> list[str]:
     """定位 20 列 fNIRS 数据。优先"光强"列, 退回"原始码值"列。
@@ -116,7 +180,8 @@ def _resolve_fnirs_columns(cols: dict) -> list[str]:
 
 
 def export_snirf(csv_path: str | Path, out_path: str | Path,
-                 subject_id: str = "aidsleep", probe: dict | None = None):
+                 subject_id: str = "aidsleep", probe: dict | None = None,
+                 fs_eeg: float | None = None):
     """CSV -> SNIRF 1.0 (HDF5), 可用 Homer3 打开验证。需 h5py。
 
     结构对照 SNIRF 1.0 规范(https://fnirs.github.io/snirf/):
@@ -145,9 +210,9 @@ def export_snirf(csv_path: str | Path, out_path: str | Path,
 
     names = _resolve_fnirs_columns(cols)
     data = np.array([cols[c] for c in names], dtype=np.float64).T      # (time, 20)
-    t = np.asarray(cols["timestamp_s"], dtype=np.float64)
-    if t.size:
-        t = t - t[0]                                                   # 规范: time 相对原点
+    # 规范: time 相对原点。旧记录的时间戳是"写盘时刻"，批量写盘时呈台阶，
+    # 直接 t-t[0] 会让 Homer3 读到一串几乎重复的采样点；这里统一走台阶检测。
+    t = _time_from_cols(cols, _fs_from_time(cols, fs_eeg))
 
     wl = np.array([760.0, 850.0])
     now = datetime.datetime.now()
@@ -173,39 +238,4 @@ def export_snirf(csv_path: str | Path, out_path: str | Path,
             g.create_dataset("detectorIndex", data=np.int32((k // 2) + 1))
             g.create_dataset("wavelengthIndex", data=np.int32((k % 2) + 1))
             g.create_dataset("dataType", data=np.int32(1))           # 1 = CW 原始幅度
-            g.create_dataset("dataTypeIndex", data=np.int32(1))      # 规范必填
-
-        pr = nirs.create_group("probe")
-        pr.create_dataset("wavelengths", data=wl)
-        # 占位几何: S4 待甲方布局坐标表冻结后, 由 probe={"source":..., "detector":...} 传入真实坐标
-        if probe is None:
-            pr.create_dataset("sourcePos3D", data=np.zeros((1, 3)))
-            pr.create_dataset("detectorPos3D", data=np.zeros((10, 3)))
-        else:
-            pr.create_dataset("sourcePos3D", data=np.asarray(probe["source"], dtype=np.float64))
-            pr.create_dataset("detectorPos3D", data=np.asarray(probe["detector"], dtype=np.float64))
-    return out_path
-
-# ---- 最小纯Python XDF写出器 (XDF 1.x, pyxdf/MoBI可读) ----
-import struct as _st
-
-def _chunk(tag: int, content: bytes, has_stream: bool = False) -> bytes:
-    n = 2 + (4 if has_stream else 0) + len(content)
-    if n <= 0xFF:
-        return b"\x01" + bytes([n]) + _st.pack("<H", tag) + content
-    return b"\x04" + _st.pack("<I", n) + _st.pack("<H", tag) + content
-
-def _stream_xml(name: str, stype: str, nch: int, fs: float, dtype: str = "float32") -> bytes:
-    chs = "".join(f"<channel><label>ch{i+1}</label><unit>uV</unit><type>{stype}</type></channel>" for i in range(nch))
-    return (f'<info><name>{name}</name><type>{stype}</type><channel_count>{nch}</channel_count>'
-            f'<nominal_srate>{fs:g}</nominal_srate><channel_format>{dtype}</channel_format>'
-            f'<desc><channels>{chs}</channels></desc></info>').encode()
-
-def export_xdf(sessions: dict, out_path: str | Path):
-    """多设备联合 -> XDF(含时钟校正信息). sessions={name:(data[ch,time], fs, stype?)}.
-    经 Storage/xdf_writer 纯python写出, 已用 pyxdf.load_xdf 回读验证, MoBI可读."""
-    from xdf_writer import write_xdf
-    norm = {}
-    for name, val in sessions.items():
-        norm[name] = (val[0], float(val[1]), val[2] if len(val) > 2 else "EEG")
-    return write_xdf(out_path, norm)
+            g.create_dataset("dataTypeIndex", data=np.int32(1))      # 规范必
