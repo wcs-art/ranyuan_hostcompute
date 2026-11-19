@@ -109,7 +109,11 @@ class Monitor14(QtWidgets.QMainWindow):
         self.btn_pause = QtWidgets.QPushButton("暂停"); self.btn_pause.setCheckable(True)
         self.btn_pause.toggled.connect(lambda v: setattr(self, "paused", v))
         self.cmb_fnirs = QtWidgets.QComboBox(); self.cmb_fnirs.addItems(["ΔHbO2", "ΔHbR"])
-        self.cmb_fnirs.currentIndexChanged.connect(lambda i: setattr(self, "show_hbo", i == 0))
+        self.cmb_fnirs.setToolTip(
+            "ΔHbO2=带氧血红蛋白(脑活动↑)，ΔHbR=脱氧血红蛋白(脑活动↓)。\n"
+            "两者是两束光(760/850nm)经 MBLL 解出的浓度变化量，单位 µM，\n"
+            "Δ 表示相对基线的变化；切换时整条历史曲线一起换。")
+        self.cmb_fnirs.currentIndexChanged.connect(self._set_fnirs_metric)
         # 时间窗口档位：上限 30s 与环形缓冲容量一致（buf_eeg/fs_eeg = 30）。
         # 再大的档横轴会画出来但波形已被覆盖成空白，现场会当成没数据。
         self.WIN_CHOICES = (1.0, 2.0, 3.0, 5.0, 10.0, 15.0, 20.0, 25.0, 30.0)
@@ -162,6 +166,16 @@ class Monitor14(QtWidgets.QMainWindow):
         qrow = QtWidgets.QHBoxLayout()
         qrow.addWidget(self.lbl_quality, 1)
         lay.addLayout(qrow)
+        # fNIRS 图例常驻界面：现场不用翻文档就能看懂切换的是什么。
+        # Δ 是相对基线变化量、单位 µM —— 这两点最容易现场误读成电压/绝对值。
+        self.lbl_fnirs_legend = QtWidgets.QLabel(
+            "fNIRS: ΔHbO2=带氧血红蛋白(脑活动↑) | ΔHbR=脱氧血红蛋白(脑活动↓) "
+            "| 760/850nm 双波长解算 | Δ=相对基线变化量, 单位 µM")
+        self.lbl_fnirs_legend.setStyleSheet("color:#666")
+        self.lbl_fnirs_legend.setToolTip(
+            "ΔHbO2 与 ΔHbR 由两束光(760/850nm)经 MBLL 联立方程解出，\n"
+            "两者相加是 ΔHbT(总血红蛋白)。切换下拉框时整条历史曲线一起换。")
+        lay.addWidget(self.lbl_fnirs_legend)
         rec = QtWidgets.QHBoxLayout()
         self.btn_record = QtWidgets.QPushButton("● 开始记录"); self.btn_record.setCheckable(True)
         self.btn_record.toggled.connect(self._toggle_record)
@@ -292,7 +306,10 @@ class Monitor14(QtWidgets.QMainWindow):
             self._esc = None
         self.t0 = time.time()
         self.buf_eeg = np.zeros((self.n_eeg, int(self.fs_eeg*30)))
-        self.buf_fn = np.zeros((10, int(self.fs_fnirs*30)))
+        # ΔHbO2/ΔHbR 各存一份：切换时整条历史曲线跟着换，不用等新帧慢慢覆盖。
+        # 旧版只有 buf_fn 一份，写入时选当时指标，切完历史段还是旧的那条。
+        self.buf_hbo = np.zeros((10, int(self.fs_fnirs*30)))
+        self.buf_hbr = np.zeros((10, int(self.fs_fnirs*30)))
         self.buf_raw = np.zeros((20, int(self.fs_fnirs*30)))
         self.battery_pct = -1.0
         self.eeg_quality = ["--"]*self.n_eeg; self.fnirs_quality = ["--"]*10
@@ -306,6 +323,22 @@ class Monitor14(QtWidgets.QMainWindow):
         self._st_tick = 0
         # 提前建默认值：push_frame 会读它，建晚了首帧就抛 AttributeError
         self._metrics = {"brain_active": 50.0, "brain_relax": 50.0, "focus": 50.0, "hr_bpm": 0.0}
+
+    @property
+    def buf_fn(self):
+        """当前显示的 fNIRS 缓冲：随 ΔHbO2/ΔHbR 切换指向对应那份。
+
+        保留这个只读属性是为兼容外部读取（测试、diag_zoom）。写入必须走
+        push_frame 的两份 roll，清零走 _clear_buffers，不要对这个属性做
+        np.roll 后回写 —— 那样只会动其中一份，另一份不同步。
+        """
+        return self.buf_hbo if self.show_hbo else self.buf_hbr
+
+    def _set_fnirs_metric(self, i: int):
+        """切换 ΔHbO2/ΔHbR：整条历史曲线立即换成另一份缓冲，不等新帧覆盖。"""
+        self.show_hbo = (i == 0)
+        self._tick(force=True)   # 暂停时 force 也只重绘、不取帧（沿用既有 frozen 语义）
+
     def _toggle_ch(self, k: int, v: bool):
         self.ch_enable[k] = v
         self.plots[k].setVisible(v)
@@ -825,8 +858,9 @@ class Monitor14(QtWidgets.QMainWindow):
         _d = self._derive_fnirs(raw)
         if _d is not None:
             hbo, hbr, self._last_od = _d
-        f = hbo if self.show_hbo else hbr
-        self.buf_fn = np.roll(self.buf_fn, -1, axis=1); self.buf_fn[:, -1] = f
+        # 两份缓冲都写：切换指标时整条历史立刻可用，不用等 30 s 慢慢覆盖。
+        self.buf_hbo = np.roll(self.buf_hbo, -1, axis=1); self.buf_hbo[:, -1] = hbo
+        self.buf_hbr = np.roll(self.buf_hbr, -1, axis=1); self.buf_hbr[:, -1] = hbr
         if raw is not None:
             self.buf_raw = np.roll(self.buf_raw, -1, axis=1); self.buf_raw[:, -1] = raw
         if acc_xyz is not None or gyro_xyz is not None:
@@ -950,7 +984,8 @@ class Monitor14(QtWidgets.QMainWindow):
     def reset_buffers(self):
         """换数据源前清空波形与分析状态，避免上一条链路的旧数据混进新曲线。"""
         self.buf_eeg[:] = 0.0
-        self.buf_fn[:] = 0.0
+        self.buf_hbo[:] = 0.0
+        self.buf_hbr[:] = 0.0
         self.buf_raw[:] = 0.0
         self._seq_last = -1
         self._lost = 0

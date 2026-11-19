@@ -753,3 +753,50 @@ def test_relabel_at_large_range_does_not_shrink_ticks(mon, app):
     now = labels()
     assert any(x.startswith("-1614") for x in now), f"再设标签后刻度缩水: {now[:6]}"
     assert not any(x.startswith("-161.") for x in now), f"出现 -161.5 这类三位数: {now[:6]}"
+
+
+# ---------------------------------------------------------------- S1 ΔHbO2/ΔHbR 切换（数据级）
+def test_fnirs_metric_switch_replaces_whole_history(mon):
+    """[规格 S1] 切 ΔHbR 后整条历史曲线必须换成 HbR，不能只换标题、只等新帧。
+
+    旧实现只有一份 buf_fn，写入时选当时指标：切完以后历史段还是 HbO2，
+    只有新进的点才是 HbR。现场表现就是"切了没反应"。
+    """
+    # raw=None 避免 _derive_fnirs 用自造光强覆盖入参；hbo/hbr 给明显不同的值
+    for i in range(60):
+        mon.push_frame(seq=i, eeg_uv=[1.0]*4, hbo=[10.0]*10, hbr=[-5.0]*10,
+                       raw=None, eeg_n=4)
+    ff = mon.fs_fnirs
+    recv = int(mon._recv)
+    cnt = min(recv, int(mon.win_s * ff))
+
+    x0, seg0 = mon._take(mon.buf_fn, recv - cnt, cnt, ff, recv)
+    assert seg0 is not None and float(seg0[0, -1]) == 10.0     # 当前是 HbO2
+
+    mon.cmb_fnirs.setCurrentIndex(1)                            # 切到 ΔHbR
+    assert mon.show_hbo is False
+    x1, seg1 = mon._take(mon.buf_fn, recv - cnt, cnt, ff, recv)
+    assert seg1 is not None
+    assert float(seg1[0, -1]) == -5.0                           # 整条尾部立刻是 HbR
+    assert not any(abs(float(v) - 10.0) < 1e-6 for v in seg1[0]), \
+        "切换后历史段仍有 HbO2 的 10.0 —— 只换了标题没换数据"
+
+    # 两份缓冲互不污染：HbO2 那份应原样保留
+    assert float(mon.buf_hbo[0, -1]) == 10.0
+    assert float(mon.buf_hbr[0, -1]) == -5.0
+
+
+def test_fnirs_metric_switch_back_and_reset(mon):
+    """[规格 S1] 切回 ΔHbO2 要立刻恢复；换源清零必须两份都清，不能只清一份。"""
+    for i in range(30):
+        mon.push_frame(seq=i, eeg_uv=[1.0]*4, hbo=[7.0]*10, hbr=[-3.0]*10,
+                       raw=None, eeg_n=4)
+    mon.cmb_fnirs.setCurrentIndex(1)
+    assert float(mon.buf_fn[0, -1]) == -3.0
+    mon.cmb_fnirs.setCurrentIndex(0)
+    assert mon.show_hbo is True
+    assert float(mon.buf_fn[0, -1]) == 7.0                      # 切回立刻恢复 HbO2
+
+    mon.reset_buffers()
+    assert not mon.buf_hbo.any() and not mon.buf_hbr.any(), \
+        "清零后仍有一份残留 —— 换源会把旧指标混进新曲线"
