@@ -12,6 +12,7 @@
 换算只发生一处: mbll_batch 内 b_λ = ΔOD_λ / (DPF_λ · L)[cm], 得到 mM。
 """
 from __future__ import annotations
+from typing import Optional, Union
 
 from dataclasses import dataclass
 
@@ -73,7 +74,7 @@ def default_params() -> FnirsOpticalParams:
     return _DEFAULT_PARAMS
 
 
-def _p(params: FnirsOpticalParams | None) -> FnirsOpticalParams:
+def _p(params: Optional[FnirsOpticalParams]) -> FnirsOpticalParams:
     return _DEFAULT_PARAMS if params is None else params
 
 
@@ -82,7 +83,7 @@ def _p(params: FnirsOpticalParams | None) -> FnirsOpticalParams:
 # --------------------------------------------------------------------------
 
 
-def raw_to_lux(raw: np.ndarray, params: FnirsOpticalParams | None = None) -> np.ndarray:
+def raw_to_lux(raw: np.ndarray, params: Optional[FnirsOpticalParams] = None) -> np.ndarray:
     """原始码值 -> 光强 lux。形状不变, 逐元素乘定标系数(单位 lux/LSB)。"""
     return np.asarray(raw, dtype=float) * _p(params).lux_per_lsb
 
@@ -107,7 +108,7 @@ def leading_mean_baseline(lux: np.ndarray, n_samples: int) -> np.ndarray:
 def od_delta(
     lux: np.ndarray,
     baseline: np.ndarray,
-    params: FnirsOpticalParams | None = None,
+    params: Optional[FnirsOpticalParams] = None,
 ) -> np.ndarray:
     """ΔOD = -ln(I/I0), 无量纲。baseline 可传外部暗帧/参考帧, 也可用 leading_mean_baseline。
 
@@ -124,7 +125,7 @@ def od_delta(
 # --------------------------------------------------------------------------
 
 
-def extinction_matrix(params: FnirsOpticalParams | None = None) -> np.ndarray:
+def extinction_matrix(params: Optional[FnirsOpticalParams] = None) -> np.ndarray:
     """2x2 消光矩阵, 行=(760, 850), 列=(HbO, HbR), 单位 1/(mM·cm)。"""
     p = _p(params)
     return np.array(
@@ -132,7 +133,7 @@ def extinction_matrix(params: FnirsOpticalParams | None = None) -> np.ndarray:
     )
 
 
-def differential_path_cm(params: FnirsOpticalParams | None = None) -> np.ndarray:
+def differential_path_cm(params: Optional[FnirsOpticalParams] = None) -> np.ndarray:
     """[DPF_760·L, DPF_850·L], 单位 cm。"""
     p = _p(params)
     return np.array([p.dpf_760 * p.src_det_cm, p.dpf_850 * p.src_det_cm], dtype=float)
@@ -153,7 +154,7 @@ class MbllResult:
     n_masked: int = 0
 
 
-def _valid_mask(valid: np.ndarray | None, shape: tuple[int, ...]) -> np.ndarray:
+def _valid_mask(valid: Optional[np.ndarray], shape: tuple[int, ...]) -> np.ndarray:
     """把外部给的通道有效位广播成 OD 形状; 不传则全有效。"""
     if valid is None:
         return np.ones(shape, dtype=bool)
@@ -169,8 +170,8 @@ def _valid_mask(valid: np.ndarray | None, shape: tuple[int, ...]) -> np.ndarray:
 def mbll_batch(
     od760: np.ndarray,
     od850: np.ndarray,
-    params: FnirsOpticalParams | None = None,
-    valid: np.ndarray | None = None,
+    params: Optional[FnirsOpticalParams] = None,
+    valid: Optional[np.ndarray] = None,
 ) -> MbllResult:
     """批量 MBLL。od760/od850 同形(任一维之前可广播), 返回同形 ΔHbO/ΔHbR [mM]。
 
@@ -215,7 +216,7 @@ def mbll_batch(
 
 
 def mbll(
-    od760: float, od850: float, params: FnirsOpticalParams | None = None
+    od760: float, od850: float, params: Optional[FnirsOpticalParams] = None
 ) -> tuple[float, float]:
     """单通道双波长 -> (ΔHbO, ΔHbR) mM。奇异时返回 (nan, nan), 不抛异常。"""
     r = mbll_batch(od760, od850, params)
@@ -243,7 +244,7 @@ class HbMetrics:
 def hb_metrics(
     hbo_mM: np.ndarray,
     hbr_mM: np.ndarray,
-    params: FnirsOpticalParams | None = None,
+    params: Optional[FnirsOpticalParams] = None,
 ) -> HbMetrics:
     """按文档公式逐元素算 ΔHbT 与变化量占比。|ΔHbT|<=hbt_eps 时占比为 NaN。"""
     p = _p(params)

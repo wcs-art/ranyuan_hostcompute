@@ -1,5 +1,6 @@
 """S2/S6/S7 存储: CSV + EDF + SNIRF + XDF, 统一时间轴."""
 from __future__ import annotations
+from typing import Optional, Union
 from pathlib import Path
 import csv, datetime
 
@@ -11,7 +12,7 @@ CSV_HEADER = (["timestamp_s", "device_id", "seq", "battery_pct", "loss_pct"]
        "brain_active", "brain_relax", "focus", "hr_bpm", "event"])
 
 class CsvWriter:
-    def __init__(self, path: str | Path, header: list[str] | None = None):
+    def __init__(self, path: Union[str, Path], header: Optional[list[str]] = None):
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.header = list(header) if header else list(CSV_HEADER)
@@ -25,7 +26,7 @@ class CsvWriter:
     def close(self):
         self.f.close()
 
-def _read_csv_columns(csv_path: str | Path) -> dict[str, list[float]]:
+def _read_csv_columns(csv_path: Union[str, Path]) -> dict[str, list[float]]:
     """CSV -> 列字典。空串(未标定/未对时)记为 0.0, 只用于数值导出。"""
     import csv as _csv
 
@@ -37,7 +38,7 @@ def _read_csv_columns(csv_path: str | Path) -> dict[str, list[float]]:
     return cols
 
 
-def _fs_from_time(cols: dict, fs_eeg: float | None = None) -> float:
+def _fs_from_time(cols: dict, fs_eeg: Optional[float] = None) -> float:
     """从 timestamp_s 反推采样率：用**总跨度**，绝不用相邻间隔中位数。
 
     台账 M1/P13 的实测：40 ms 定时器每拍批量取 8~20 帧，写盘时刻几乎相同，
@@ -89,7 +90,7 @@ def _time_from_cols(cols: dict, fs: float):
     return t - t[0]
 
 
-def _eeg_signals(cols: dict, fs_eeg: float | None):
+def _eeg_signals(cols: dict, fs_eeg: Optional[float]):
     """CSV -> (4 路信号, 采样率, 信号头)。EDF/BDF 共用，避免两份格式参数走偏。"""
     import math
 
@@ -147,13 +148,13 @@ def _write_edf_family(csv_path, out_path, fs_eeg, file_type: int):
     return out_path
 
 
-def export_edf(csv_path: str | Path, out_path: str | Path, fs_eeg: float | None = None):
+def export_edf(csv_path: Union[str, Path], out_path: Union[str, Path], fs_eeg: Optional[float] = None):
     """CSV -> EDF，第三方可用 EDFbrowser / MNE 打开验证。"""
     import pyedflib
     return _write_edf_family(csv_path, out_path, fs_eeg, pyedflib.FILETYPE_EDF)
 
 
-def export_bdf(csv_path: str | Path, out_path: str | Path, fs_eeg: float | None = None):
+def export_bdf(csv_path: Union[str, Path], out_path: Union[str, Path], fs_eeg: Optional[float] = None):
     """CSV -> BDF（24-bit EEG 欧洲数据格式），合同 S2 ②要求 EDF/BDF 两种格式。
 
     必须手写 EdfWriter 而不是 highlevel.write_edf(file_type=BDF)：
@@ -179,9 +180,9 @@ def _resolve_fnirs_columns(cols: dict) -> list[str]:
     )
 
 
-def export_snirf(csv_path: str | Path, out_path: str | Path,
-                 subject_id: str = "aidsleep", probe: dict | None = None,
-                 fs_eeg: float | None = None):
+def export_snirf(csv_path: Union[str, Path], out_path: Union[str, Path],
+                 subject_id: str = "aidsleep", probe: Optional[dict] = None,
+                 fs_eeg: Optional[float] = None):
     """CSV -> SNIRF 1.0 (HDF5), 可用 Homer3 打开验证。需 h5py。
 
     结构对照 SNIRF 1.0 规范(https://fnirs.github.io/snirf/):
@@ -238,4 +239,84 @@ def export_snirf(csv_path: str | Path, out_path: str | Path,
             g.create_dataset("detectorIndex", data=np.int32((k // 2) + 1))
             g.create_dataset("wavelengthIndex", data=np.int32((k % 2) + 1))
             g.create_dataset("dataType", data=np.int32(1))           # 1 = CW 原始幅度
-            g.create_dataset("dataTypeIndex", data=np.int32(1))      # 规范必
+            g.create_dataset("dataTypeIndex", data=np.int32(1))      # 规范必填
+
+        pr = nirs.create_group("probe")
+        pr.create_dataset("wavelengths", data=wl)
+        # 占位几何: S4 待甲方布局坐标表冻结后, 由 probe={"source":..., "detector":...} 传入真实坐标
+        if probe is None:
+            pr.create_dataset("sourcePos3D", data=np.zeros((1, 3)))
+            pr.create_dataset("detectorPos3D", data=np.zeros((10, 3)))
+        else:
+            pr.create_dataset("sourcePos3D", data=np.asarray(probe["source"], dtype=np.float64))
+            pr.create_dataset("detectorPos3D", data=np.asarray(probe["detector"], dtype=np.float64))
+    return out_path
+
+# ---- 最小纯Python XDF写出器 (XDF 1.x, pyxdf/MoBI可读) ----
+import struct as _st
+
+def _chunk(tag: int, content: bytes, has_stream: bool = False) -> bytes:
+    n = 2 + (4 if has_stream else 0) + len(content)
+    if n <= 0xFF:
+        return b"\x01" + bytes([n]) + _st.pack("<H", tag) + content
+    return b"\x04" + _st.pack("<I", n) + _st.pack("<H", tag) + content
+
+def _stream_xml(name: str, stype: str, nch: int, fs: float, dtype: str = "float32") -> bytes:
+    chs = "".join(f"<channel><label>ch{i+1}</label><unit>uV</unit><type>{stype}</type></channel>" for i in range(nch))
+    return (f'<info><name>{name}</name><type>{stype}</type><channel_count>{nch}</channel_count>'
+            f'<nominal_srate>{fs:g}</nominal_srate><channel_format>{dtype}</channel_format>'
+            f'<desc><channels>{chs}</channels></desc></info>').encode()
+
+def export_xdf(sessions: dict, out_path: Union[str, Path],
+               clock_offsets: Optional[dict] = None):
+    """多设备联合 -> XDF。sessions={name:(data[ch,time], fs, stype?, t0?)}。
+
+    clock_offsets={name:[(t, off)..]}：LSL 时钟校正信息，**没有真实来源就不传**，
+    writer 不再替你写一条假的 0 偏移（那会让下游误以为已经对时）。
+    """
+    from xdf_writer import write_xdf
+    norm = {}
+    for name, val in sessions.items():
+        item = (val[0], float(val[1]), val[2] if len(val) > 2 else "EEG")
+        if len(val) > 3:
+            item += (float(val[3]),)          # 真实起始时间戳（秒）
+        norm[name] = item
+    return write_xdf(out_path, norm, clock_offsets=clock_offsets)
+
+
+def export_xdf_from_csv(csv_path: Union[str, Path], out_path: Union[str, Path],
+                        fs_eeg: Optional[float] = None):
+    """把**已记录的那份 CSV** 导成 XDF（而不是界面缓冲区里的最后 2000 点）。
+
+    时钟校正：CSV 的 time_abs_ms 是设备对时后的 Unix ms；用它减去同行的
+    timestamp_s（记录内相对秒）得到这台设备的时钟偏移，写进 XDF tag=4。
+    未对时（time_abs_ms 全空）就不写 tag=4，明确表示"无校正信息"。
+    多设备联合记录需由调用方把各设备的 CSV 分别导出后合并，本函数不伪造多设备流。
+    """
+    import statistics
+
+    import numpy as np
+
+    cols = _read_csv_columns(csv_path)
+    fs = _fs_from_time(cols, fs_eeg)
+    if fs <= 0:
+        fs = float(fs_eeg or 500.0)
+    t = _time_from_cols(cols, fs)
+    eeg_cols = [f"eeg{i+1}_uv" for i in range(4)]
+    eeg = np.asarray([cols[c] for c in eeg_cols if c in cols], dtype=np.float64)
+    if eeg.size == 0:
+        raise ValueError("CSV 里没有 EEG 列，无法导出 XDF")
+    streams = {"Aidsleep_EEG_1": (eeg, fs, "EEG", float(t[0]) if t.size else 0.0)}
+    intensity_cols = _resolve_fnirs_columns(cols)
+    fn = np.asarray([cols[c] for c in intensity_cols], dtype=np.float64)
+    if fn.size:
+        streams["Aidsleep_fNIRS_1"] = (fn, fs, "fNIRS", float(t[0]))
+    abs_ms = [v for v in cols.get("time_abs_ms", []) if v > 0]
+    offsets = None
+    if abs_ms and t.size == len(cols.get("time_abs_ms", [])):
+        diff = [a / 1000.0 - float(s) for a, s in zip(cols["time_abs_ms"], t)
+                if a > 0]
+        if diff:
+            off = float(statistics.median(diff))
+            offsets = {name: [(float(t[0]), off)] for name in streams}
+    return export_xdf(streams, out_path, clock_offsets=offsets)

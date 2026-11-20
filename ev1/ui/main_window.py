@@ -2,13 +2,15 @@
 from __future__ import annotations
 import sys, time
 import numpy as np
-from PyQt5 import QtWidgets, QtCore
+from PyQt5 import QtWidgets, QtCore, QtGui
 
 
 class ClassicMainWindow(QtWidgets.QMainWindow):
     def __init__(self):
         super().__init__()
-        self._base_title = "燃元科技数据采集显示上位机"
+        # 构建标记：重启后看标题栏即可确认跑的是不是新代码（改源码不会影响
+        # 已启动的进程，也不会更新 dist 里旧 exe；看到这个标记才说明重载成功）。
+        self._base_title = "燃元科技数据采集显示上位机  [build 2026-11-19 Esc-fix]"
         self.setWindowTitle(self._base_title)
         self.resize(1600, 950)
         self.source = None          # 由 main() 注入或界面"连接"按钮创建, 用于读链路统计
@@ -189,6 +191,28 @@ class ClassicMainWindow(QtWidgets.QMainWindow):
         self.mon.timer.stop()  # 用本窗统一节拍, 避免双定时器
         self._t_link = QtCore.QTimer(); self._t_link.timeout.connect(self._refresh_link)
         self._t_link.start(500)
+        # Esc 退出单通道放大 —— 必须挂在本窗口(真正显示、有焦点), 不能挂 mon 自己。
+        # 根因: 这里只把 mon.centralWidget() 嵌进来(见上文 line ~29), Monitor14
+        # 这个窗口对象从不 show, 挂在它上面的 QShortcut 不在活动窗口链里,
+        # 用户按 Esc 永远不触发(界面标题却写着"按 Esc 返回")。本窗口是真正
+        # 接收键盘的顶层窗, WindowShortcut 在此 reliably 生效。
+        # _restore_grid 自带 "非放大态直接 return" 守卫, 平时按 Esc 无副作用。
+        self._esc = QtWidgets.QShortcut(QtGui.QKeySequence("Esc"), self)
+        self._esc.setContext(QtCore.Qt.WindowShortcut)
+        self._esc.activated.connect(self.mon._restore_grid)
+
+    def keyPressEvent(self, e):
+        """Esc 退出单通道放大的兜底通道。
+
+        QShortcut 依赖窗口管理器的快捷键分发，个别打包环境/无边框窗口下会被吞；
+        这里再接一层真实按键事件，落在主窗口或其子控件上的 Esc 一律还原放大页。
+        两层都调 _restore_grid（自带非放大态守卫），重复触发无副作用。
+        """
+        if e.key() == QtCore.Qt.Key_Escape:
+            self.mon._restore_grid()
+            e.accept()
+            return
+        super().keyPressEvent(e)
 
     # ---------------- 链路连接 ----------------
     def _rescan_ports(self):

@@ -33,6 +33,7 @@
     0x09 TEST_SIGNAL  1B 1=打开 ADS1299 内部方波 0=关闭
 """
 from __future__ import annotations
+from typing import Optional, Union
 
 import struct
 from dataclasses import dataclass, field
@@ -81,7 +82,7 @@ def crc16_modbus(data: bytes) -> int:
     return crc & 0xFFFF
 
 
-def encode(dev: int, cmd: "Cmd | int", payload: bytes = b"") -> bytes:
+def encode(dev: int, cmd: "Union[Cmd, int]", payload: bytes = b"") -> bytes:
     """组一条下行命令帧。payload 上限 255 字节（len 字段只有 1 字节）。"""
     if not 0 <= int(dev) <= 255:
         raise ValueError(f"device_id 必须在 0..255, 收到 {dev!r}")
@@ -182,7 +183,7 @@ class Response:
         return f"未知状态码 {self.status}"
 
 
-def decode_response(raw: bytes) -> "Response | None":
+def decode_response(raw: bytes) -> "Optional[Response]":
     """解析一帧应答。长度不符或帧头不对返回 None，由调用方决定是重同步还是报错。"""
     raw = bytes(raw)
     if len(raw) < 8 or raw[:2] != RSP_HEAD:
@@ -198,7 +199,7 @@ def decode_response(raw: bytes) -> "Response | None":
     )
 
 
-def response_len(raw: bytes) -> "int | None":
+def response_len(raw: bytes) -> "Optional[int]":
     """只读帧头与长度字段，告诉调用方"这帧总共几个字节"，用于半帧等待。"""
     if len(raw) < 6 or raw[:2] != RSP_HEAD:
         return None

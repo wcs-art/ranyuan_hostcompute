@@ -8,6 +8,7 @@
 k 与 SAT_LUX 仍是待甲方定标值, 不冒充已确认参数。
 """
 from __future__ import annotations
+from typing import Optional, Union
 
 from dataclasses import dataclass
 
@@ -18,7 +19,7 @@ SAT_LUX = 60000.0           # fNIRS光强饱和上限(待甲方确认)
 DARK_LUX = 50.0             # 暗噪声基线下限(待甲方确认)
 DARK_SIGMA_K = 3.0          # 暗判据 μ_dark + k·σ_dark 的 k(文档未给, 待定标)
 
-def eeg_contact(eeg_uv: np.ndarray, impedance_kohm: np.ndarray | None = None) -> list[str]:
+def eeg_contact(eeg_uv: np.ndarray, impedance_kohm: Optional[np.ndarray] = None) -> list[str]:
     """返回每导联状态: 好/接触差/坏道."""
     out = []
     for i, v in enumerate(np.atleast_2d(eeg_uv)):

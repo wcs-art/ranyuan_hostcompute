@@ -16,6 +16,7 @@
     结论：合同 F2 的验收判据无法由此格式判定，该结论须写入结论台账。
 """
 from __future__ import annotations
+from typing import Optional, Union
 
 import time
 from pathlib import Path
@@ -32,7 +33,7 @@ MAX_COLS = 256
 MAX_PENDING = 1 << 20
 
 
-def parse_line(line: bytes) -> list[float] | None:
+def parse_line(line: bytes) -> Optional[list[float]]:
     """一行原始字节 -> 数值列表；解析不出返回 None。
 
     支持的写法：
@@ -82,8 +83,8 @@ class TextDecoder:
         self.n_short = 0          # 列数少于 EEG 通道数的行
         self.n_extra = 0          # 多出映射之外的列（已丢弃）
         self.col_hist: dict[int, int] = {}
-        self._t_first: float | None = None
-        self._t_last: float | None = None
+        self._t_first: Optional[float] = None
+        self._t_last: Optional[float] = None
 
     # ---- 统计 ----
     def dominant_cols(self) -> int:
@@ -187,7 +188,7 @@ class TextSource:
     kind = "text"
 
     def __init__(self, com: str = "COM3", baud: int = 921600,
-                 raw_dump: str | Path | None = None, retry_s: float = 2.0):
+                 raw_dump: Optional[Union[str, Path]] = None, retry_s: float = 2.0):
         from receivers import SerialReceiver   # 延迟导入: 无 pyserial 时不影响其它链路
         from source import RawDumper
 
@@ -240,7 +241,7 @@ class TextFileSource:
 
     kind = "text-file"
 
-    def __init__(self, path: str | Path, chunk_sizes: tuple[int, ...] = (1471, 37, 2048, 5, 900)):
+    def __init__(self, path: Union[str, Path], chunk_sizes: tuple[int, ...] = (1471, 37, 2048, 5, 900)):
         self.path = Path(path)
         if not self.path.exists():
             raise SystemExit(f"文本回放文件不存在: {self.path}")

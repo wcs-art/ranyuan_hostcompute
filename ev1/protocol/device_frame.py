@@ -57,6 +57,7 @@ v1 字节表（偏移为帧内绝对偏移，全部小端；24bit 采样值为�
     改增益/改前置必须调用 configure()，不要改这里。
 """
 from __future__ import annotations
+from typing import Optional, Union
 
 import struct
 from dataclasses import dataclass, field
@@ -177,7 +178,7 @@ def layouts() -> dict[str, FrameLayout]:
     return {"v1": LAYOUT_V1, "v1r5": LAYOUT_V1R5, "compat90": LAYOUT_COMPAT90}
 
 
-def set_layout(name_or_layout: "str | FrameLayout") -> FrameLayout:
+def set_layout(name_or_layout: "Union[str, FrameLayout]") -> FrameLayout:
     """切换布局。切完清空解码器缓存 —— 帧长变了，旧半帧不能续。"""
     global _LAYOUT
     if isinstance(name_or_layout, FrameLayout):
@@ -250,9 +251,9 @@ def __getattr__(name: str):
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
-def configure(layout=None, gain: float | None = None,
-              vref: float | None = None,
-              preamp_gain: float | None = None) -> FrameLayout:
+def configure(layout=None, gain: Optional[float] = None,
+              vref: Optional[float] = None,
+              preamp_gain: Optional[float] = None) -> FrameLayout:
     """一次把"帧长"和"增益折算"都设好。main/source 启动时按 config/run.json 调用。"""
     global _GAIN, _VREF, _PREAMP, EEG_GAIN_UV_PER_LSB
     if gain is not None:
@@ -321,7 +322,7 @@ def _i24(v: int) -> bytes:
 
 def pack_frame(dev: int, seq: int, ts: int, eeg: list[int], fnirs: list[list[int]],
                ev_t: int = 0, ev_ts: int = 0, *, ts_abs: int = 0,
-               flags: int | None = None, layout: FrameLayout | None = None) -> bytes:
+               flags: Optional[int] = None, layout: Optional[FrameLayout] = None) -> bytes:
     """按当前布局组一帧。eeg 长度 = n_eeg*ratio；fnirs 长度 = n_fnirs × n_wl。"""
     ly = layout or _LAYOUT
 

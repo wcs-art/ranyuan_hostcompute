@@ -2,6 +2,7 @@
 对照要求§三S2-XDF(含时钟校正信息)+§八S7. 格式依据pyxdf reader实现:
 magic XDF: + chunk[不定长长度 tag-u16 (stream_id-u32) payload], tag:1文件头 2流头 3采样 4时钟偏移 6流尾."""
 from __future__ import annotations
+from typing import Optional, Union
 import struct
 from pathlib import Path
 
@@ -10,7 +11,7 @@ def _varlen(n: int) -> bytes:
     if n < 2**32: return b"\x04" + struct.pack("<I", n)
     return b"\x08" + struct.pack("<Q", n)
 
-def _chunk(tag: int, stream_id: int | None, payload: bytes) -> bytes:
+def _chunk(tag: int, stream_id: Optional[int], payload: bytes) -> bytes:
     body = struct.pack("<H", tag)
     if stream_id is not None: body += struct.pack("<I", stream_id)
     body += payload
@@ -24,7 +25,7 @@ def _stream_xml(name: str, stype: str, nch: int, fs: float, fmt: str, labels: li
             f"<channel_count>{nch}</channel_count><nominal_srate>{fs}</nominal_srate>"
             f"<channel_format>{fmt}</channel_format><desc><channels>{chs}</channels></desc></info>").encode()
 
-def write_xdf(path: str | Path, streams: dict, clock_offsets: dict | None = None) -> Path:
+def write_xdf(path: Union[str, Path], streams: dict, clock_offsets: Optional[dict] = None) -> Path:
     """streams={name:(data[ch,time] float32, fs, type)}; clock_offsets={name:[(t,off)..]}."""
     import numpy as np
     out = Path(path); out.parent.mkdir(parents=True, exist_ok=True)

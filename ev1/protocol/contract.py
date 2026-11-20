@@ -181,7 +181,7 @@ def _flatten_raw(fnirs_raw: list[list[int]]) -> list[float]:
     return out[: N_FNIRS * len(FNIRS_WLS)]
 
 
-def unnest_raw(flat, n_wl: int | None = None) -> list[list[float]]:
+def unnest_raw(flat, n_wl: Optional[int] = None) -> list[list[float]]:
     """_flatten_raw 的逆操作: 平铺 20 列 -> [10][2]。
 
     界面层拿到的是平铺的 raw(便于画图), 写 CSV 要走 frame_to_row, 需要嵌套形状。

@@ -294,12 +294,15 @@ class Monitor14(QtWidgets.QMainWindow):
         self._stack.addWidget(self._solo_page)
         self._stack.setCurrentWidget(self._grid_page)
 
-        # 键盘 Esc 还原（现场全屏看细节后不用去找鼠标）。
-        # 主界面是把本窗口的 centralWidget 嵌进去用的，这里不能用 WindowShortcut
-        # —— 那个"窗口"从来没显示过，快捷键永远不触发。
+        # 键盘 Esc 还原 —— 仅用于「本窗口独立 show」的调试路径。
+        # 主界面(ClassicMainWindow)只嵌 centralWidget, 本窗口从不 show,
+        # 挂在这里的快捷键不在活动窗口链里; 真正接收按键的那层由主窗口自己装
+        # (见 main_window.py 构造末尾), 不要在这里用 WidgetWithChildrenShortcut
+        # 假装覆盖嵌入式场景 —— 实测不触发, 界面却写着"按 Esc 返回"。
+        # 用 WindowShortcut: 独立 show 时 self 就是顶层窗口, 能触发。
         try:
             sc = QtWidgets.QShortcut(QtGui.QKeySequence("Esc"), self)
-            sc.setContext(QtCore.Qt.WidgetWithChildrenShortcut)
+            sc.setContext(QtCore.Qt.WindowShortcut)
             sc.activated.connect(self._restore_grid)
             self._esc = sc
         except Exception:  # noqa: BLE001

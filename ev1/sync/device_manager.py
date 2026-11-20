@@ -3,11 +3,11 @@
 时钟模型: 每设备维护 offset = pc_clock - dev_clock 的滑动中位估计;
 真机用 pylsl.time_correction() feeding, 仿真/串口用帧时间戳对时命令回算."""
 from __future__ import annotations
+from typing import Optional, Union
 import time
 from dataclasses import dataclass, field
 
 MAX_DEVICES = 8
-
 @dataclass
 class DeviceState:
     device_id: int
@@ -17,7 +17,6 @@ class DeviceState:
     recv: int = 0
     offsets: list = field(default_factory=list)  # 最近N次时钟偏移(s)
     last_seen: float = 0.0
-
     reboots: int = 0
     def feed_seq(self, seq: int):
         if self.last_seq >= 0:
@@ -31,7 +30,7 @@ class DeviceState:
         self.last_seq = seq; self.recv += 1
         self.last_seen = time.time()
 
-    def feed_clock(self, dev_ts_ms: int, pc_ts_ms: int | None = None):
+    def feed_clock(self, dev_ts_ms: int, pc_ts_ms: Optional[int] = None):
         pc = time.time()*1000 if pc_ts_ms is None else pc_ts_ms
         self.offsets.append((pc - dev_ts_ms)/1000.0)
         self.offsets = self.offsets[-120:]

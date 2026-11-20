@@ -13,6 +13,7 @@
 在界面上显示为明确的中文原因, 而不是"没有数据"。
 """
 from __future__ import annotations
+from typing import Optional, Union
 
 import socket
 import threading
@@ -39,7 +40,7 @@ class _ByteReceiver:
         self.bufsize = int(bufsize)
         self.q: deque[bytes] = deque(maxlen=QUEUE_MAX)
         self.running = False
-        self.error: str | None = None
+        self.error: Optional[str] = None
         self.n_packets = 0
         self.n_bytes = 0
         self.last_rx_t: float = 0.0
@@ -55,7 +56,7 @@ class _ByteReceiver:
         self.last_rx_t = time.time()
 
     # --- 对外接口(与旧版兼容) ---
-    def pop(self) -> bytes | None:
+    def pop(self) -> Optional[bytes]:
         return self.q.popleft() if self.q else None
 
     def stats(self) -> dict:

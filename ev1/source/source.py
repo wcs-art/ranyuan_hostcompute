@@ -20,7 +20,7 @@ import math
 import random
 import time
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Union
 
 from device_frame import pack_frame, parse_stream
 import device_frame
@@ -127,7 +127,7 @@ class RawDumper:
                          模组是否按帧边界分包、有没有把多帧粘成一个大包
     """
 
-    def __init__(self, path: str | Path):
+    def __init__(self, path: Union[str, Path]):
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._f = self.path.open("wb")
@@ -167,7 +167,7 @@ class RealSource(Source):
     kind = "real"
 
     def __init__(self, port: int = 5000, proto: str = "udp", host: str = "0.0.0.0",
-                 com: str = "COM3", baud: int = 921600, raw_dump: str | Path | None = None):
+                 com: str = "COM3", baud: int = 921600, raw_dump: Optional[Union[str, Path]] = None):
         from receivers import make_receiver
 
         self.proto = proto
@@ -244,7 +244,7 @@ class DrySource(Source):
 
     kind = "dry"
 
-    def __init__(self, path: str | Path, chunk_sizes: tuple[int, ...] = (1471, 37, 2048, 5, 900)):
+    def __init__(self, path: Union[str, Path], chunk_sizes: tuple[int, ...] = (1471, 37, 2048, 5, 900)):
         self.path = Path(path)
         self._data = self.path.read_bytes()
         self._pos = 0
@@ -314,7 +314,7 @@ def make_source(kind: str = "real", **kw) -> Source:
     raise SystemExit(f"未知 --source={kind}, 可选 sim / real / dry / text / text-file")
 
 
-def parse_argv(argv: list[str], base: dict | None = None) -> dict:
+def parse_argv(argv: list[str], base: Optional[dict] = None) -> dict:
     """极简参数解析, 不引入 argparse 依赖(3 档 source + 四种链路 + 回放文件)。
 
     base: 来自 config/run.json 的默认值, 命令行参数覆盖它。这样"双击 exe"
