@@ -1,4 +1,4 @@
-"""工程测试面板：脑电自检信号、灯珠强制点亮、读寄存器。命令码见 docs/数据协议_v1.md §6.3。"""
+"""工程测试面板：脑电自检信号、灯珠强制点亮、读寄存器。"""
 from __future__ import annotations
 
 from PyQt5 import QtWidgets

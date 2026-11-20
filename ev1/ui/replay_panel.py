@@ -1,4 +1,4 @@
-"""回放已存的 CSV：按原采样率推送到 14 通道波形和姿态、指标面板。"""
+"""CSV 回放：按原采样率推送到波形与指标面板。"""
 from __future__ import annotations
 import sys, csv
 import numpy as np

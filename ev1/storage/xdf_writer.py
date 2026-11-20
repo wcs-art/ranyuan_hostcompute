@@ -1,6 +1,4 @@
-"""最小XDF v1写出器(纯python, 无第三方依赖), 写出文件可被 pyxdf.load_xdf / MoBI 读取.
-对照要求§三S2-XDF(含时钟校正信息)+§八S7. 格式依据pyxdf reader实现:
-magic XDF: + chunk[不定长长度 tag-u16 (stream_id-u32) payload], tag:1文件头 2流头 3采样 4时钟偏移 6流尾."""
+"""最小 XDF v1 写出器（纯 Python，无第三方依赖）。"""
 from __future__ import annotations
 from typing import Optional, Union
 import struct

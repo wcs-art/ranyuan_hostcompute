@@ -1,4 +1,4 @@
-"""S2/S6/S7 存储: CSV + EDF + SNIRF + XDF, 统一时间轴."""
+"""存储导出：CSV + EDF + SNIRF + XDF，统一时间轴。"""
 from __future__ import annotations
 from typing import Optional, Union
 from pathlib import Path

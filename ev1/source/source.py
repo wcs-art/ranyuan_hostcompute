@@ -1,19 +1,4 @@
-"""B0 数据源三态: sim / real / dry, 统一接口 poll_frames() -> list[dict].
-
-为什么要有这一层:
-  界面(ui/monitor_14ch.py:260)要求 receiver 提供 poll_frames(),
-  但 transport/receivers.py 只有 pop() -> 返回字节块, 不返回帧。
-  那句话"谁负责切帧"从来没接上。本文件就是那个接上它的小件,
-  并且把三种数据来源收敛成同一个接口, 避免 sim / real 走两条不同代码路径。
-
-关键设计: sim 也走 pack_frame -> parse_stream 真实解析链路。
-  现在的 sim 是在 ui/monitor_14ch.py:266 直接现算正弦波, 绕过了 CRC/切帧/折算,
-  所以仿真永远绿、真机永远红。让 sim 走真实解析路径, 解析层的 bug 在仿真阶段就会暴露。
-
-产出契约: poll_frames() 返回 list[dict], 键与 Monitor14.push_frame 形参名一致
-  (见 contract.frame_to_ui_dict)。界面侧 :281 已支持 push_frame(**fr), 因此按名传参,
-  不会重演 8 元组按位置展开导致的 acc->battery 错位。
-"""
+"""数据源三态：sim / real / dry，统一 poll_frames() 接口。"""
 from __future__ import annotations
 
 import math

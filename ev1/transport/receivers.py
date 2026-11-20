@@ -1,17 +1,4 @@
-"""L1 传输层: WiFi(UDP / TCP服务端 / TCP客户端) + Type-C串口, 只出字节, 不解析帧.
-
-职责边界: 本层只负责"把字节搬进来", 不做切帧、不做 CRC、不做折算。
-切帧在 device_frame.FrameSlicer, 上层统一经 source.RealSource.poll_frames() 取帧。
-
-四种链路的选择取决于 ESP8285/ESP-M1 模组的工作模式(现场用 AT 指令查):
-  - 模组配成 UDP 透传, 主动往 PC 的 IP:端口发  -> udp        (本机 bind 监听)
-  - 模组配成 TCP Client, 主动连 PC              -> tcp        (本机 bind+listen, 来连就收)
-  - 模组配成 TCP Server, 等 PC 来连             -> tcp-client (本机主动 connect 模组IP)
-  - Type-C 走 USB 转串口                        -> serial
-
-三种失败都必须"说清楚", 不能静默: 端口被占用、模组连不上、串口打不开,
-在界面上显示为明确的中文原因, 而不是"没有数据"。
-"""
+"""链路接收：WiFi（UDP/TCP 服务端/客户端）+ 串口，只出字节不解析帧。"""
 from __future__ import annotations
 from typing import Optional, Union
 

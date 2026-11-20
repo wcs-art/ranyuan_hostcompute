@@ -1,5 +1,4 @@
-"""字节流切帧: 只把字节流切成完整的帧字节块, 不解析字段、不算 CRC。
-"""
+"""字节流切帧：只切成完整帧字节块，不解析字段。"""
 from __future__ import annotations
 class FrameSlicer:
 

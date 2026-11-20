@@ -1,5 +1,4 @@
-"""S7首版: 单设备LSL三路推流(睡眠脑电/前额血氧/睡眠事件标记), pylsl可接收验证. 对照要求§八.
-终版多机统一时间轴预留device_id->Outlet映射. 未装pylsl时为占位模式(仅缓存)."""
+"""单设备 LSL 三路推流：脑电、前额血氧、事件标记。"""
 from __future__ import annotations
 try:
     from pylsl import StreamInfo, StreamOutlet

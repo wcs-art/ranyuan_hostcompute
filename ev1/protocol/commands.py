@@ -1,37 +1,4 @@
-"""上位机 -> 下位机 下行命令编码（合同 F2 对时 / F4 工程测试 / F5 配置 / F8 同步触发）。
-
-为什么先有编码、没有发送
-    传输层（receivers.py）的四个链路都只有收，没有发；而固件侧的接收逻辑也还没确认。
-    command 帧格式一旦冻结，固件才能写解析、上位机才能挂到链路上。
-    所以这里先把**字节格式**用代码钉死（含单测），等固件对上以后再补 send_command()。
-    合同 F2 原文："上位机下发的对时/同步命令格式须在协议文档中定义" —— 本文件就是那个定义。
-
-命令帧（上位机 -> 下位机）
-
-    AA 56 | dev(1) | cmd(1) | len(1) | payload(len) | crc16(2, 小端)
-
-    帧头 2 字节是 AA 56（与上行数据的 AA 55 区分开，避免串线时互相误判）。
-    CRC16/MODBUS 覆盖 dev..payload（不含帧头、不含 CRC 自身）。
-
-应答帧（下位机 -> 上位机）
-
-    AA 57 | dev(1) | cmd(1) | status(1) | len(1) | payload(len) | crc16(2)
-
-    status: 0=成功, 1=未知命令, 2=参数错, 3=忙(上一命令未完成)
-    读寄存器时 payload 返回读到的值。
-
-命令表
-
-    0x01 SET_TIME     u64 Unix 毫秒                对时：设备据此填帧内 ts_abs_ms
-    0x02 SYNC_OUT     1B 周期码 0=关 1=0.5Hz 2=1Hz 3=2Hz
-    0x03 SOFT_MARKER  1B 事件类型(1..255)          软标记，等价于按下设备事件键
-    0x04 REG_WRITE    1B 芯片 1B 寄存器 1B 值      芯片 0=ADS1299, 1..8=AFE4404
-    0x05 REG_READ     1B 芯片 1B 寄存器
-    0x06 SET_CONFIG   2B EEG 采样率(Hz) 1B LED 电流码 1B 通道使能位图
-    0x07 START_STOP   1B 1=开始采集 0=停止
-    0x08 LED_FORCE    1B 通道 1B 1=强制点亮 0=恢复   F4 单 LED 强制点亮
-    0x09 TEST_SIGNAL  1B 1=打开 ADS1299 内部方波 0=关闭
-"""
+"""下行命令编码：对时、工程测试、配置、同步触发。"""
 from __future__ import annotations
 from typing import Optional, Union
 

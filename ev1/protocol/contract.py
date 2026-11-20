@@ -1,21 +1,4 @@
-"""B0 数据契约: 一帧数据的唯一形状 + 三条转换.
-
-设计约束(见 docs/DECISIONS.md 待补):
-  1. 本文件不依赖 numpy / PyQt / 任何 IO, 只做纯数据转换 —— 因此可被单测直接覆盖。
-  2. 全仓只允许此处定义"一帧数据长什么样"。链路层产出 Frame,
-     配套层用 frame_to_row, 界面层用 frame_to_ui_dict, 三者不再各自发明形状。
-  3. 未标定的物理量一律写 None -> CSV 写空串, 不写 0.0 冒充。
-     "空"和"零"在数据上不是一回事, 填 0 会让下游算出看起来合理的错结果。
-
-对应缺陷(交接文档实证):
-  - ui/monitor_14ch.py:199 push_frame 形参第 6 位是 battery,
-    而 :260 attach_receiver 的 docstring 约定第 8 位是 battery,
-    :281 用 push_frame(*fr) 按位置展开 -> acc->battery 错位。
-    本文件用 frame_to_ui_dict 返回 dict, 由 push_frame(**d) 按名传参, 从构造上消除错位。
-  - Storage/exporters.py:7 CSV_HEADER 缺 20 列光强/光功率密度(S2 必需),
-    且混入 6 列 S8 姿态 + 4 列 S9 指标(范围外)。本文件把三者拆成
-    REQUIRED / OPTIONAL_S2 / EXTRA 三组, 默认只输出 REQUIRED。
-"""
+"""数据契约：一帧数据的唯一形状与转换。"""
 from __future__ import annotations
 
 import math

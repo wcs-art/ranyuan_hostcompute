@@ -1,4 +1,4 @@
-"""离线自检：用程序内自造的数据检查模块自洽性，不读设备字节，**不构成验收**。"""
+"""离线自检：用程序内自造数据检查模块自洽性，不构成验收。"""
 from __future__ import annotations
 import sys, time, traceback
 import numpy as np

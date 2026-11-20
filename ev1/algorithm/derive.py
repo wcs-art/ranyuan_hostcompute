@@ -1,16 +1,4 @@
-"""B2: 光强 -> OD -> ΔHbO/ΔHbR 数值链 (modified Beer-Lambert).
-
-约束: 纯函数, 无 I/O, 无 Qt, 无全局可变状态; 系数全部由 FnirsOpticalParams 注入。
-
-单位约定(全模块统一, 除注明处不做隐式换算):
-    光强 lux          —— 由 lux_per_lsb 从原始码值折算
-    OD   -ln(I/I0)    —— 无量纲
-    ε    1/(mM·cm)    —— 消光系数
-    L, DPF·L  cm      —— 源检距 / 有效光程
-    ΔHbO/ΔHbR  mM     —— MBLL 直接解出 mM; 需 µM 由调用方 ×1000
-
-换算只发生一处: mbll_batch 内 b_λ = ΔOD_λ / (DPF_λ · L)[cm], 得到 mM。
-"""
+"""光强 → OD → ΔHbO/ΔHbR 数值链（修正 Beer-Lambert 定律）。"""
 from __future__ import annotations
 from typing import Optional, Union
 

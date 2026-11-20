@@ -1,5 +1,4 @@
-"""F8同步与触发(首版): SYNC IN事件标记/SYNC OUT 0.5-1-2Hz/软标记. 对照要求§十三F8+§十二事件字段.
-事件统一经帧内事件类型1B+事件戳4B进入数据流; 时间戳=上电归零单调ms(§十二)."""
+"""同步事件：SYNC IN 事件标记、SYNC OUT 脉冲、软标记。"""
 from __future__ import annotations
 import time
 EV_NONE=0; EV_SYNC_IN=1; EV_EXT_TRIG=2; EV_SOFT=3; EV_SYNC_OUT=4

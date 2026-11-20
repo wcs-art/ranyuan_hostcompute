@@ -1,6 +1,4 @@
-"""S7终版: LSL持续时钟校正+统一时间轴, 局域网对齐误差≤1ms判定.
-对照要求§一§八. 真机: 对每设备 inlet 轮询 time_correction(), 偏移中位值回填 DeviceManager;
-仿真: 用本地时钟演示判定逻辑."""
+"""LSL 持续时钟校正与统一时间轴。"""
 from __future__ import annotations
 import time
 import numpy as np

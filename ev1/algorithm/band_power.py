@@ -1,10 +1,4 @@
-"""L5 算法层 · 频带功率与状态指标（自包含，无遗留依赖）。
-从 power_cal.py 与 Algorithm/state_metrics.py、metrics_state.py 迁移而来，
-目的只有一个：让新界面不再依赖旧目录，从而可以安全删除旧版本。
-迁移原则：只搬界面真正在用的部分（Welch 频带功率 + 状态四指标），
-不搬 power_cal 里的绘图/Excel/离线批处理（那些属旧版单通道工具）。
-依赖：numpy、scipy。不 import Algorithm/、不 import pandas（不需要）。
-"""
+"""频带功率与状态指标计算（δ/θ/α/β 等）。"""
 from __future__ import annotations
 
 from dataclasses import dataclass

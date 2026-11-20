@@ -1,7 +1,4 @@
-"""S7终版: 多设备管理(发现/接入/断开≥8台)+跨设备时钟偏移实时显示+统一时间轴.
-对照要求§八§一(局域网对齐误差≤1ms, LSL持续时钟校正).
-时钟模型: 每设备维护 offset = pc_clock - dev_clock 的滑动中位估计;
-真机用 pylsl.time_correction() feeding, 仿真/串口用帧时间戳对时命令回算."""
+"""多设备管理：发现/接入/断开、跨设备时钟偏移、统一时间轴。"""
 from __future__ import annotations
 from typing import Optional, Union
 import time

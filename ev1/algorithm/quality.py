@@ -1,12 +1,4 @@
-"""S3终版质量框架: EEG接触状态(联动阻抗)+fNIRS暗噪声基线/饱和标记+坏道自动标记.
-对照原文§2.3 S3. 阻抗值由固件经事件/扩展帧下发, 未到先用阈值法占位(阈值见config).
-
-文档《fNIRS和血氧计算20261012---VR002》§1.4/§1.5 的落地:
-    μ_dark = (1/N)Σx_i, σ_dark = sqrt(Σ(x_i-μ_dark)²/(N-1))
-    异常通道不做处理, 正常通道才进 MBLL。
-文档没给 k(σ 倍数)与饱和上限的具体数值, 因此这里只做可注入的判据框架,
-k 与 SAT_LUX 仍是待甲方定标值, 不冒充已确认参数。
-"""
+"""质量评估：EEG 接触状态、fNIRS 暗噪声基线与饱和、坏道标记。"""
 from __future__ import annotations
 from typing import Optional, Union
 

@@ -1,4 +1,4 @@
-"""14 通道实时波形：4 路 EEG + 10 通道 fNIRS，统一时间轴，可缩放、暂停、记录导出。"""
+"""14 通道实时波形：4 路 EEG + 10 通道 fNIRS，可缩放、暂停、导出。"""
 from __future__ import annotations
 import sys, time, math, numpy as np
 from PyQt5 import QtWidgets, QtCore, QtGui

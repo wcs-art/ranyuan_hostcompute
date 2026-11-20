@@ -1,16 +1,4 @@
-"""B3 下行发送通路: UDP → TCP → 串口 逐级降级.
-
-设计约束(见任务书 B3):
-- 命令帧唯一来源是 ``transport.receivers.build_cmd``, 本文件不重写帧头/CRC/帧长.
-- ``send()`` 只返回 ``SendResult``, 不返回裸 bool, 不静默吞异常:
-  每条腿的失败都落进 ``attempts`` 与 ``reason``, 全失败时 ``ok=False`` 且 ``reason`` 非空.
-- 传输实现可在构造时注入(``udp=`` / ``tcp=`` / ``serial_transport=``), 便于用内存假对象测试;
-  默认实现在首次 ``send`` 时才创建, import 本模块不开端口、不碰串口.
-- 每条腿超时有界: UDP 0.15s / TCP 0.2s / 串口 0.1s, 最坏 ~0.45s, 端口不通不会挂住.
-- **UDP 无 ACK**: 目标端口无人监听时 sendto 仍"成功"(本机 ICMP 不可达不会同步返回),
-  只有 socket 层错误(地址解析失败/网络不可达/短写)才判失败并降级.
-  需要投递确认请走 TCP 或读回读命令, 不要靠 UDP 返回值判定设备是否收到.
-"""
+"""下行发送通路：UDP → TCP → 串口逐级降级。"""
 from __future__ import annotations
 
 import socket
