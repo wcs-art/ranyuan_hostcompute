@@ -27,5 +27,5 @@
 | `ev1/storage/` | 存储导出 | exporters、xdf_writer | CSV/EDF/BDF/SNIRF/XDF 导出、XDF 真实时钟校正 |
 | `ev1/ui/` | 界面 | main_window、monitor_14ch、panels、replay_panel、test_panel、verify_center | PyQt5 主窗口、14 通道波形显示与放大、回放/测试/验证面板 |
 
-模块之间保持平级 import（如 `from contract import Frame`），不写包前缀；这是靠 `ev1_paths.py` 在启动时把各子目录加入 `sys.path` 实现的，新增子目录只需在 `ev1_paths.py` 和打包配置的路径列表里各加一处。
+
 
