@@ -4,7 +4,17 @@
 实时显示、记录，并导出为 CSV / EDF / BDF / SNIRF / XDF。
 
 ## 运行环境
-- Python 3.10+
+- Python 3.9.13（线上编译加密系统同版本；代码已适配，注解不依赖 3.10 语法）
+
+### 源码运行
+```
+.venv\Scripts\python.exe main.py
+```
+
+### 打包
+```
+.venv\Scripts\python.exe -m PyInstaller packaging/HostComputer6.spec --noconfirm
+```
 
 
 

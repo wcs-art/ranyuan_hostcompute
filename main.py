@@ -136,7 +136,10 @@ def _run_dry_headless(src) -> int:
 
 def main() -> None:
     install_crash_hook()
-    _ensure_on_path(ROOT / "ev1")
+    # ev1/ 已按职责分 7 个子目录；统一用 ev1_paths 把全部子目录加进 sys.path，
+    # 这样各模块仍按平级模块名 import，不必改 25 个文件的 import 语句。
+    from ev1_paths import ev1_dirs
+    _ensure_on_path(*ev1_dirs())
     from source import make_source, parse_argv
 
     opts = parse_argv(sys.argv[1:], base=_load_run_config())

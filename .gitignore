@@ -70,3 +70,12 @@ req_check.txt
 /tests/test_claims_discipline.py
 /tests/test_doc_refs.py
 
+# 测试代码：回归证据留在本地磁盘，不入库（运行/打包都不依赖 tests/）
+/tests/
+/pytest.ini
+
+# 诊断脚本与打包配置：留在本地磁盘，不入库
+# tools/ 仅供现场抓包诊断；packaging/ 是本地 PyInstaller spec，线上编译用自己的流程
+/tools/
+/packaging/
+
