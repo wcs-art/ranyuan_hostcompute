@@ -156,6 +156,8 @@ class RealSource(Source):
         from receivers import make_receiver
 
         self.proto = proto
+        self.com = com
+        self.baud = int(baud)
         self._rx = make_receiver(proto, port=port, host=host, com=com, baud=baud)
         self._buf = bytearray()
         self._dump = RawDumper(raw_dump) if raw_dump else None
@@ -184,11 +186,13 @@ class RealSource(Source):
             self._buf += chunk
         frames = []
         for df in parse_stream(self._buf):
-            fr = contract.from_protocol(df, t_host_s=time.time())
-            if not fr.crc_ok:
+            if not df.crc_ok:
                 self.n_crc_bad += 1
+                continue
             if not getattr(df, "header_ok", True):
                 self.n_hdr_bad += 1
+                continue
+            fr = contract.from_protocol(df, t_host_s=time.time())
             frames.append(contract.frame_to_ui_dict(fr))
         if frames:
             self.n_frames += len(frames)
@@ -250,7 +254,7 @@ class DrySource(Source):
         self._buf += self._data[self._pos:self._pos + n]
         self._pos += n
         frames = [contract.frame_to_ui_dict(contract.from_protocol(df))
-                  for df in parse_stream(self._buf)]
+                  for df in parse_stream(self._buf) if df.crc_ok and df.header_ok]
         self.frames_read += len(frames)
         return frames
 
@@ -305,13 +309,14 @@ def parse_argv(argv: list[str], base: Optional[dict] = None) -> dict:
     base: 来自 config/run.json 的默认值, 命令行参数覆盖它。这样"双击 exe"
           也能连真机, 不必每次都敲命令行。
     """
-    # 默认 real: 上位机启动即等真机数据。合成数据必须显式 --source=sim,
+    # 默认 real/serial/fw100: 对应当前固件 USART1 的 100 字节二进制帧。
+    # 合成数据必须显式 --source=sim,
     # 避免现场"看到波形在动就以为板子通了"。(2026-11-12)
-    out = {"source": "real", "port": 5000, "proto": "udp", "replay": None,
+    out = {"source": "real", "port": 5000, "proto": "serial", "replay": None,
            "extra_cols": False, "headless": False,
            "host": "0.0.0.0", "com": "COM3", "baud": 921600, "raw_dump": None,
            # 帧布局与 ADS1299 增益: 合同 F2 要求折算系数随增益联动, 所以增益必须是配置项
-           "protocol": "v1", "eeg_gain": 24.0, "eeg_vref": 4.5,
+           "protocol": "fw100", "eeg_gain": 24.0, "eeg_vref": 4.5,
            # 合同 A3 前置 INA333 G=1000±5%（硬件固定值）。显示值要折算到电极端,
            # 必须除以它; 漏除就是所有 EEG 数值大 1000 倍。
            "eeg_preamp_gain": 1000.0}

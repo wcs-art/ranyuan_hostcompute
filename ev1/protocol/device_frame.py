@@ -30,11 +30,13 @@ class FrameLayout:
     has_counts: bool = True
     #: 是否含 8 字节绝对时间戳
     has_abs_ts: bool = True
+    #: 首版固件的短帧头：dev/ver/flags，没有通道数字段
+    has_short_header: bool = False
 
     # ---- 偏移推导（帧内绝对偏移） ----
     @property
     def off_seq(self) -> int:
-        return 9 if self.has_counts else 3
+        return 9 if self.has_counts else (5 if self.has_short_header else 3)
 
     @property
     def off_ts_mono(self) -> int:
@@ -95,6 +97,8 @@ def _default_layout() -> FrameLayout:
 
 
 LAYOUT_V1 = _default_layout()
+LAYOUT_FW100 = FrameLayout("fw100", has_counts=False, has_abs_ts=True,
+                           has_short_header=True)
 LAYOUT_COMPAT90 = FrameLayout("compat90", has_counts=False, has_abs_ts=False)
 
 
@@ -118,7 +122,8 @@ def get_layout() -> FrameLayout:
 
 
 def layouts() -> dict[str, FrameLayout]:
-    return {"v1": LAYOUT_V1, "v1r5": LAYOUT_V1R5, "compat90": LAYOUT_COMPAT90}
+    return {"v1": LAYOUT_V1, "v1r5": LAYOUT_V1R5,
+            "fw100": LAYOUT_FW100, "compat90": LAYOUT_COMPAT90}
 
 
 def set_layout(name_or_layout: "Union[str, FrameLayout]") -> FrameLayout:
@@ -278,6 +283,12 @@ def pack_frame(dev: int, seq: int, ts: int, eeg: list[int], fnirs: list[list[int
         body += struct.pack("<II", int(seq) & 0xFFFFFFFF, int(ts) & 0xFFFFFFFF)
         if ly.has_abs_ts:
             body += struct.pack("<Q", int(ts_abs) & 0xFFFFFFFFFFFFFFFF)
+    elif ly.has_short_header:
+        body = bytes([int(dev) & 0xFF, PROTO_VER,
+                      (0 if flags is None else flags) & 0xFF])
+        body += struct.pack("<IIQ", int(seq) & 0xFFFFFFFF,
+                            int(ts) & 0xFFFFFFFF,
+                            int(ts_abs) & 0xFFFFFFFFFFFFFFFF)
     else:
         body = struct.pack("<BII", int(dev) & 0xFF, int(seq) & 0xFFFFFFFF, int(ts) & 0xFFFFFFFF)
 
@@ -312,6 +323,12 @@ def _parse_frame(raw: bytes, ly: FrameLayout) -> DataFrame:
         # 帧头自报的通道数必须与上位机配置一致，否则切帧边界就是错的 —— 不能静默放过
         header_ok = (ver == PROTO_VER and n_eeg == ly.n_eeg and n_fnirs == ly.n_fnirs
                      and n_wl == ly.n_wl and ratio == max(1, ly.ratio))
+    elif ly.has_short_header:
+        dev, ver, flags = body[:3]
+        seq, ts, ts_abs = struct.unpack("<IIQ", body[3:19])
+        n_eeg, n_fnirs, n_wl, ratio = ly.n_eeg, ly.n_fnirs, ly.n_wl, 1
+        p = 19
+        header_ok = ver == PROTO_VER
     else:
         dev, seq, ts = struct.unpack("<BII", body[:9])
         ver, n_eeg, n_fnirs, n_wl, ratio, flags, ts_abs = 0, ly.n_eeg, ly.n_fnirs, ly.n_wl, 1, 0, 0

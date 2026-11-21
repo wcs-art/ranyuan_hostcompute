@@ -1,12 +1,12 @@
 """上位机统一入口(源码运行与PyInstaller打包共用).
 
 数据源与链路(任一组合):
-  python main.py --source=real --proto=udp --port=5000     # 默认: 模组 UDP 透传, 往本机端口发
+  python main.py --source=real --proto=udp --port=5000     # 切到无线输出时: 模组 UDP 透传
   python main.py --source=real --proto=tcp --port=5000     # 模组 TCP Client, 主动连本机
   python main.py --source=real --proto=tcp-client --host=192.168.4.1 --port=8080
                                                           # 模组 TCP Server, 本机主动连
-  python main.py --source=real --proto=serial --com=COM3 --baud=921600
-                                                          # Type-C 有线(AA55 二进制帧)
+  python main.py --source=real --proto=serial --com=COM3 --baud=921600 --protocol=fw100
+                                                          # 默认: USART1 有线(100B AA55 二进制帧)
   python main.py --source=text --com=COM3 --baud=921600    # Type-C 有线(ASCII 文本行, 如 FireWater)
   python main.py --source=text --replay=t.txt              # 文本文件回放(不碰串口)
   python main.py --source=real --raw-dump=capture/x.bin    # 同时把原始字节落盘, 供帧格式比对

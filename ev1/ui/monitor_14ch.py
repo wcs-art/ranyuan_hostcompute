@@ -59,7 +59,9 @@ class Monitor14(QtWidgets.QMainWindow):
         self.n_total = self.n_eeg + N_FNIRS
         self.setWindowTitle(f"{self.n_total}通道同步显示 (统一时间轴)")
         self.paused = False; self.show_hbo = True
-        self.win_s = 10.0; self.fs_eeg = 500.0; self.fs_fnirs = 100.0
+        # 当前固件每个 EEG 帧都带一组 fNIRS 占位字段，绘图缓存也每帧写一次。
+        # fs_fnirs 在此表示绘图点率，而不是未来光学板的物理采样率。
+        self.win_s = 10.0; self.fs_eeg = 500.0; self.fs_fnirs = 500.0
         # 采样率初值，接上设备后由实测帧率覆盖
         self.fs_measured = 0.0
         self._fs_snapped = False
@@ -311,9 +313,13 @@ class Monitor14(QtWidgets.QMainWindow):
         self.buf_eeg = np.zeros((self.n_eeg, int(self.fs_eeg*30)))
         # ΔHbO2/ΔHbR 各存一份：切换时整条历史曲线跟着换，不用等新帧慢慢覆盖。
         # 旧版只有 buf_fn 一份，写入时选当时指标，切完历史段还是旧的那条。
-        self.buf_hbo = np.zeros((10, int(self.fs_fnirs*30)))
-        self.buf_hbr = np.zeros((10, int(self.fs_fnirs*30)))
-        self.buf_raw = np.zeros((20, int(self.fs_fnirs*30)))
+        # push_frame 每帧都写浓度曲线，容量必须与 EEG 一样覆盖完整 30 秒。
+        # 否则 3000 点按 500 帧/秒写入只剩 6 秒，10 秒窗左侧会空白。
+        # 两条浓度缓存按样本序号环形写入，避免 500 SPS 时每帧搬移整段历史。
+        self.buf_hbo = np.zeros((10, int(self.fs_eeg*30)))
+        self.buf_hbr = np.zeros((10, int(self.fs_eeg*30)))
+        # 原始光强只用于最近 50 帧的质控，保留较短缓存即可。
+        self.buf_raw = np.zeros((20, 3000))
         self.battery_pct = -1.0
         self.eeg_quality = ["--"]*self.n_eeg; self.fnirs_quality = ["--"]*10
         self._fnirs_levels = []          # S3: 每通道(最小,中位,最大)光强，暗噪声基线显示用
@@ -861,9 +867,10 @@ class Monitor14(QtWidgets.QMainWindow):
         _d = self._derive_fnirs(raw)
         if _d is not None:
             hbo, hbr, self._last_od = _d
-        # 两份缓冲都写：切换指标时整条历史立刻可用，不用等 30 s 慢慢覆盖。
-        self.buf_hbo = np.roll(self.buf_hbo, -1, axis=1); self.buf_hbo[:, -1] = hbo
-        self.buf_hbr = np.roll(self.buf_hbr, -1, axis=1); self.buf_hbr[:, -1] = hbr
+        # 两份浓度缓存都按绝对样本序号环形写入，切换指标时历史立刻可用。
+        fn_col = (self._n_fn - 1) % self.buf_hbo.shape[1]
+        self.buf_hbo[:, fn_col] = hbo
+        self.buf_hbr[:, fn_col] = hbr
         if raw is not None:
             self.buf_raw = np.roll(self.buf_raw, -1, axis=1); self.buf_raw[:, -1] = raw
         if acc_xyz is not None or gyro_xyz is not None:
@@ -1236,6 +1243,19 @@ class Monitor14(QtWidgets.QMainWindow):
         if cnt < 2:
             return None, None
         B = buf.shape[1]
+        if buf is self.buf_hbo or buf is self.buf_hbr:
+            # 浓度缓冲按绝对样本序号环形存储；显示时按时间顺序取视窗。
+            first = max(0, i0, recv - B)
+            last = min(recv, i0 + cnt)
+            if last - first < 2:
+                return None, None
+            indexes = np.arange(first, last)
+            x = indexes / fs
+            seg = buf[:, indexes % B]
+            if seg.shape[1] > MAX_DRAW:
+                step = int(np.ceil(seg.shape[1] / MAX_DRAW))
+                x = x[::step]; seg = seg[:, ::step]
+            return x, seg
         off = recv - B                       # 缓冲第 0 列对应的绝对样本序号
         c0 = max(0, i0 - off); c1 = min(B, i0 + cnt - off)
         if c1 - c0 < 2:
