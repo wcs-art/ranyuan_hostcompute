@@ -10,7 +10,7 @@ class ClassicMainWindow(QtWidgets.QMainWindow):
         super().__init__()
         # 构建标记：重启后看标题栏即可确认跑的是不是新代码（改源码不会影响
         # 已启动的进程，也不会更新 dist 里旧 exe；看到这个标记才说明重载成功）。
-        self._base_title = "燃元科技数据采集显示上位机  [build 2026-11-19 Esc-fix]"
+        self._base_title = "燃元科技数据采集显示上位机  [build 2026-11-23 xaxis-nonneg]"
         self.setWindowTitle(self._base_title)
         self.resize(1600, 950)
         self.source = None          # 由 main() 注入或界面"连接"按钮创建, 用于读链路统计
@@ -26,7 +26,7 @@ class ClassicMainWindow(QtWidgets.QMainWindow):
         self.mon.lbl_store.hide()  # S2: 记录状态统一看底部lbl_store
         if hasattr(self.mon, "ch_scroll"):
             self.mon.ch_scroll.hide()  # S1: 通道开关只留外部一条, 内嵌条隐藏
-        left_box = QtWidgets.QGroupBox("14通道同步显示 · 统一时间轴 (S1)")
+        left_box = QtWidgets.QGroupBox("14通道同步显示 · 默认 ECG1-ECG4 / 滚轮翻页 (S1)")
         left_lay = QtWidgets.QVBoxLayout(left_box)
         left_lay.addWidget(self.mon.centralWidget())
         # 通道开关条 (S1/E5)
@@ -210,6 +210,14 @@ class ClassicMainWindow(QtWidgets.QMainWindow):
         """
         if e.key() == QtCore.Qt.Key_Escape:
             self.mon._restore_grid()
+            e.accept()
+            return
+        if e.key() == QtCore.Qt.Key_Left:
+            self.mon._turn_page(-1)
+            e.accept()
+            return
+        if e.key() == QtCore.Qt.Key_Right:
+            self.mon._turn_page(1)
             e.accept()
             return
         super().keyPressEvent(e)
@@ -538,7 +546,7 @@ class ClassicMainWindow(QtWidgets.QMainWindow):
 
     def open_64(self):
         from monitor_14ch import Monitor14
-        w = Monitor14(eeg_names=[f"EEG{i+1}" for i in range(64)])
+        w = Monitor14(eeg_names=[f"ECG{i+1}" for i in range(64)])
         for k, cb in enumerate(self._chks):
             if k < len(w.plots):
                 w._toggle_ch(k, cb.isChecked())

@@ -56,8 +56,6 @@ def _load_run_config() -> dict:
             except Exception as e:  # noqa: BLE001
                 log(f"[WARN] 配置文件 {p} 解析失败, 已忽略: {e}")
     return {}
-
-
 def _ensure_on_path(*dirs: Path) -> None:
     for directory in dirs:
         path_str = str(directory)

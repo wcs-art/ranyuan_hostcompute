@@ -9,6 +9,9 @@ import contract   # _rec_row 依赖它; 缺失时 NameError 会被 _tick 的 exc
 from derive import default_params as _derive_default_params  # 光学系数唯一出处
 
 N_EEG = 4; N_FNIRS = 10
+#: 默认一屏 4 路、2×2 铺满；其余通道分页，滚轮/左右滑动/按钮翻页。
+PAGE_SIZE = 4
+PAGE_COLS = 2
 
 #: 自动量程用的分位点。不能用 max/min 定量程: 现场一个半包毛刺就能把量程撑到
 #: 上万倍, 真实信号被压成一条直线。实测例子: 数据在 -112666 附近波动 ±40,
@@ -54,7 +57,7 @@ class Monitor14(QtWidgets.QMainWindow):
         self._receiver = None
         #: 设备编号取自帧头 device_id，不能写死
         self._device_id = 1
-        self.eeg_names = eeg_names or [f"EEG{i+1}" for i in range(N_EEG)]
+        self.eeg_names = eeg_names or [f"ECG{i+1}" for i in range(N_EEG)]
         self.n_eeg = len(self.eeg_names)
         self.n_total = self.n_eeg + N_FNIRS
         self.setWindowTitle(f"{self.n_total}通道同步显示 (统一时间轴)")
@@ -205,23 +208,55 @@ class Monitor14(QtWidgets.QMainWindow):
         self._ylbl_hi = []       # 网格图里"纵轴上限"的读数
         self._ylbl_lo = []       # 网格图里"纵轴下限"的读数
         names = ch_labels
-        ncols = 2 if self.n_total <= 16 else 4
-        self._names = names; self._ncols = ncols
-        self._nrows = (len(names) + ncols - 1) // ncols
-        #: 单通道放大看的是哪一路；None = 14 图并排
+        self._names = names
+        # 兼容旧测试/外部脚本：网格永远 2 列，但每页只有 4 路。
+        self._ncols = PAGE_COLS
+        self._nrows = 2
+        #: 单通道放大看的是哪一路；None = 回到分页网格
         self._solo = None
         #: 最近一次点到的子图，供工具栏按钮"放大当前"用
         self._focus_idx = 0
-        # 14 图放在"网格页"，单通道放大放在"大图页"，用 QStackedWidget 切。
-        # 前一次实现是在同一个 QGridLayout 里把子图 addWidget 跨满格子来放大：
-        # 放大能成，但还原时格子已被重排，14 图的高度分布回不到原样
-        # （实测单张可绘区 5.1px -> 还原后 64.1px），而且重排过程中量程/跟随状态
-        # 会互相打架。分页之后网格永不改动，放大缩小是可逆的。
+        # 网格页内部再分 4 张一页：默认 ECG1~ECG4 铺满一屏，剩下 fNIRS 翻页看。
+        # 单通道放大仍在最外层 QStackedWidget：放大/缩小只切页，不动任何子图布局。
         self._stack = QtWidgets.QStackedWidget()
         lay.addWidget(self._stack, 1)
         self._grid_page = QtWidgets.QWidget()
-        gl = QtWidgets.QGridLayout(self._grid_page); gl.setContentsMargins(0, 0, 0, 0)
-        self._gl = gl
+        gp = QtWidgets.QVBoxLayout(self._grid_page)
+        gp.setContentsMargins(0, 0, 0, 0); gp.setSpacing(2)
+        nav = QtWidgets.QHBoxLayout()
+        self._btn_prev_page = QtWidgets.QPushButton("◀ 上一页")
+        self._lbl_page = QtWidgets.QLabel("第 1/1 页")
+        self._lbl_page.setAlignment(QtCore.Qt.AlignHCenter)
+        self._btn_next_page = QtWidgets.QPushButton("下一页 ▶")
+        tip = "滚轮 / 左右滑 / ←→ 翻页；Ctrl+滚轮缩放时间轴"
+        self._btn_prev_page.setToolTip(tip); self._btn_next_page.setToolTip(tip)
+        self._btn_prev_page.clicked.connect(lambda: self._turn_page(-1))
+        self._btn_next_page.clicked.connect(lambda: self._turn_page(1))
+        for w in (self._btn_prev_page, self._lbl_page, self._btn_next_page):
+            nav.addWidget(w)
+        gp.addLayout(nav)
+        self._page_stack = QtWidgets.QStackedWidget()
+        gp.addWidget(self._page_stack, 1)
+        self._pages = []
+        self._page_layouts = []
+        n_pages = (len(names) + PAGE_SIZE - 1) // PAGE_SIZE
+        for pi in range(n_pages):
+            page = QtWidgets.QWidget()
+            gl = QtWidgets.QGridLayout(page)
+            gl.setContentsMargins(0, 0, 0, 0)
+            gl.setHorizontalSpacing(2); gl.setVerticalSpacing(2)
+            cnt = min(PAGE_SIZE, len(names) - pi * PAGE_SIZE)
+            gl.setRowStretch(0, 1)
+            gl.setRowStretch(1, 1 if cnt > PAGE_COLS else 0)
+            gl.setColumnStretch(0, 1); gl.setColumnStretch(1, 1)
+            self._page_stack.addWidget(page)
+            self._pages.append(page)
+            self._page_layouts.append(gl)
+        self._gl = self._page_layouts[0] if self._page_layouts else None
+        self._page = 0
+        self._plot_viewboxes = []
+        self._drag_start = None
+        self._drag_obj = None
         self._stack.addWidget(self._grid_page)
         for r, n in enumerate(names):
             p = pg.PlotWidget(title=n, axisItems={'left': _RawValueAxis('left')})
@@ -259,7 +294,19 @@ class Monitor14(QtWidgets.QMainWindow):
                 (self._ylbl_hi if top else self._ylbl_lo).append(lb)
             # 14 图并排时每张只有几十像素高，起伏看不出来。双击任何一张 -> 单独放大
             p.scene().sigMouseClicked.connect(lambda ev, k=r: self._on_plot_click(ev, k))
-            gl.addWidget(p, r // ncols, r % ncols); self.plots.append(p); self.curves.append(c)
+            pi, k = divmod(r, PAGE_SIZE)
+            li, lj = divmod(k, PAGE_COLS)
+            self._page_layouts[pi].addWidget(p, li, lj)
+            self.plots.append(p); self.curves.append(c)
+            self._plot_viewboxes.append(p.getViewBox())
+            p.installEventFilter(self)
+            try:
+                p.getViewBox().installEventFilter(self)
+                p.getViewBox().grabGesture(QtCore.Qt.SwipeGesture)
+            except Exception:  # noqa: BLE001 - 某些 Qt 构建没有手势支持
+                pass
+
+        self._show_page(0)
 
         # ---- 单通道大图页 ----
         # 独立的一张 PlotWidget, 不搬动网格里的子图: 放大/缩小只是切页, 几何状态零副作用
@@ -268,7 +315,7 @@ class Monitor14(QtWidgets.QMainWindow):
         head = QtWidgets.QHBoxLayout()
         self._lbl_solo = QtWidgets.QLabel("单通道放大")
         self._lbl_solo.setStyleSheet("font-weight:bold")
-        self._btn_back = QtWidgets.QPushButton("← 返回 14 图")
+        self._btn_back = QtWidgets.QPushButton("← 返回 4 图")
         self._btn_back.clicked.connect(self._restore_grid)
         head.addWidget(self._lbl_solo, 1); head.addWidget(self._btn_back)
         sl.addLayout(head)
@@ -351,6 +398,73 @@ class Monitor14(QtWidgets.QMainWindow):
     def _toggle_ch(self, k: int, v: bool):
         self.ch_enable[k] = v
         self.plots[k].setVisible(v)
+
+    # ---- 4 路一页的分页导航 ----
+    def _page_title(self, idx: int) -> str:
+        a = idx * PAGE_SIZE
+        b = min(a + PAGE_SIZE, self.n_total)
+        return f"第 {idx + 1}/{len(self._pages)} 页 · {self._names[a]}~{self._names[b - 1]}"
+
+    def _show_page(self, idx: int):
+        """切到指定页。页内 2×2 布局永不重排，放大还原才可逆。"""
+        if not self._pages:
+            return
+        self._page = max(0, min(int(idx), len(self._pages) - 1))
+        self._page_stack.setCurrentIndex(self._page)
+        self._btn_prev_page.setEnabled(self._page > 0)
+        self._btn_next_page.setEnabled(self._page < len(self._pages) - 1)
+        self._lbl_page.setText(self._page_title(self._page))
+        # 工具栏"放大当前"应对准本页第一路，而不是已翻走那一页的旧焦点。
+        self._focus_idx = min(self._page * PAGE_SIZE, len(self.plots) - 1)
+
+    def _turn_page(self, step: int):
+        """滚轮 / 左右滑 / 按钮翻页；单通道放大态不改页。"""
+        if getattr(self, "_solo", None) is not None:
+            return
+        self._show_page(self._page + int(step))
+
+    def eventFilter(self, obj, ev):
+        """网格页上：普通滚轮/左右滑翻页，Ctrl+滚轮仍交给 pyqtgraph 缩放时间轴。"""
+        watch = obj in self.plots or obj in getattr(self, "_plot_viewboxes", [])
+        if getattr(self, "_solo", None) is not None or not watch:
+            return super().eventFilter(obj, ev)
+        t = ev.type()
+        if t == QtCore.QEvent.Wheel:
+            if ev.modifiers() & QtCore.Qt.ControlModifier:
+                return super().eventFilter(obj, ev)
+            d = ev.angleDelta()
+            if abs(d.x()) > abs(d.y()):
+                step = -1 if d.x() > 0 else (1 if d.x() < 0 else 0)
+            else:
+                step = -1 if d.y() > 0 else (1 if d.y() < 0 else 0)
+            if step:
+                self._turn_page(step)
+                ev.accept()
+                return True
+        elif t == QtCore.QEvent.MouseButtonPress and ev.button() == QtCore.Qt.LeftButton:
+            self._drag_start = ev.pos()
+            self._drag_obj = obj
+        elif t == QtCore.QEvent.MouseButtonRelease and self._drag_start is not None \
+                and obj is self._drag_obj:
+            dx = ev.pos().x() - self._drag_start.x()
+            dy = ev.pos().y() - self._drag_start.y()
+            self._drag_start = None
+            self._drag_obj = None
+            if abs(dx) > 70 and abs(dx) > abs(dy) * 1.5:
+                self._turn_page(1 if dx < 0 else -1)
+                ev.accept()
+                return True
+        elif t == QtCore.QEvent.Gesture:
+            try:
+                g = ev.gesture(QtCore.Qt.SwipeGesture)
+                if g is not None:
+                    self._turn_page(1 if g.direction() == QtCore.Qt.SwipeLeft else -1)
+                    ev.accept()
+                    return True
+            except Exception:  # noqa: BLE001 - 无触摸/无手势支持的构建直接忽略
+                pass
+        return super().eventFilter(obj, ev)
+
     # ---- 单通道放大 / 还原 ----
     def _title_of(self, i: int) -> str:
         return self._names[i] if i < len(self._names) else f"CH{i+1}"
@@ -445,12 +559,12 @@ class Monitor14(QtWidgets.QMainWindow):
         lo, hi = self._view_bounds(self.plots[i])
         self._big.setXRange(lo, hi, padding=0)
         self._stack.setCurrentWidget(self._solo_page)
-        self.btn_solo.setText("⤢ 返回 14 图")
+        self.btn_solo.setText("⤢ 返回 4 图")
         # _follow / btn_follow 原样保留：手动缩放过就继续停在那一段
         self._tick(force=True)            # 立刻重画，不要等下一个 40ms 节拍
 
     def _restore_grid(self):
-        """回到 14 图并排。时间视野与跟随状态都原样带回来。"""
+        """回到默认 4 图一页。时间视野与跟随状态都原样带回来。"""
         if self._solo is None:
             return
         lo, hi = self._view_bounds(self._big)
@@ -515,7 +629,8 @@ class Monitor14(QtWidgets.QMainWindow):
         """用户拖过/滚过就停止自动改范围，否则每 40ms 被抢回，缩放等于没有。
 
         src 是用户缩的那张图（0~13，-1=单通道大图）。记住它，之后按它的范围取数据，
-        并把 14 张图统一到同一段，否则缩 A 图、B 图还在老位置，看着像数据对不上。
+        并把所有图统一到同一段，否则缩 A 图、B 图还在老位置，看着像数据对不上。
+        时间轴是累计秒数，左边界不许为负；pyqtgraph 的 ViewBox 自己会把视图拖出 0 以前。
         """
         if isinstance(src, int):
             self._zoom_src = src
@@ -523,6 +638,35 @@ class Monitor14(QtWidgets.QMainWindow):
             self._follow = False
             self.btn_follow.setChecked(False)
             self.lbl.setText("已手动缩放：不再自动跟随，点「跟随最新」恢复")
+        self._unify_time_axis(src)
+
+    def _unify_time_axis(self, src=None):
+        """把用户刚改的那张图的横轴夹到非负，再同步给全部子图和大图。
+
+        空屏（_recv==0）时 _tick 提前 return，原来只有拿到数据时才做同步，
+        于是等待数据状态下拖一张图，四张图横轴各走各的 —— 现场截图里
+        -6~17 / -20~70 / 1~9 / 8.8~9.8 就是这条路径漏掉的结果。
+        """
+        big = getattr(self, "_big", None)
+        targets = list(self.plots) + ([big] if big is not None else [])
+        if not targets:
+            return
+        if src == -1 and big is not None:
+            ref = big
+        elif isinstance(src, int) and 0 <= src < len(self.plots):
+            ref = self.plots[src]
+        else:
+            ref = big if (self._solo is not None and big is not None) else targets[0]
+        v0, v1 = self._view_bounds(ref)
+        if v0 < 0.0:
+            v1 -= v0                       # 整体右移，保持用户选的窗宽
+            v0 = 0.0
+        if not (v1 > v0):
+            v0, v1 = 0.0, float(self.win_s)
+        for p in targets:
+            a, b = self._view_bounds(p)
+            if abs(a - v0) > 1e-6 or abs(b - v1) > 1e-6:
+                p.setXRange(v0, v1, padding=0)
     def _apply_axis_labels(self):
         """单位随链路变：二进制是折算后的 μV，文本是未换算的原始值。
 
@@ -1099,6 +1243,10 @@ class Monitor14(QtWidgets.QMainWindow):
                 self._hide_ylabels(i)
             self._big_curve.setData([], [])
             self._big_tip.setText("等待数据…"); self._big_tip.show()
+            # 空屏也要守住"四图同一把尺 + 时间不为负"。上面这段提前 return，
+            # 旧代码只有拿到数据才同步，等待连接时拖一下就会出现四种横轴。
+            if not self._follow:
+                self._unify_time_axis()
             return
         # 画哪一段样本：跟随时取最近一窗；手动缩放过就按当前视图范围取。
         # 以前固定只取 win*fs 点，缩出去只能看到"一段 10 秒的短线"，
