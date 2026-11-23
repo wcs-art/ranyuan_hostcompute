@@ -5,6 +5,39 @@ import numpy as np
 from PyQt5 import QtWidgets, QtCore, QtGui
 
 
+class _ConnectionWorker(QtCore.QThread):
+    ready = QtCore.pyqtSignal(object)
+    failed = QtCore.pyqtSignal(str)
+
+    def __init__(self, kind, com, baud, port, target_ip, parent=None):
+        super().__init__(parent)
+        self.kind, self.com, self.baud = kind, com, baud
+        self.port, self.target_ip = port, target_ip
+
+    def run(self):
+        src = None
+        try:
+            if self.kind == "udp":
+                from receivers import request_eeg_udp_mode
+                request_eeg_udp_mode(self.com, self.baud)
+            from source import make_source
+            src = make_source(self.kind, com=self.com, baud=self.baud,
+                              port=self.port, host="0.0.0.0", target_ip=self.target_ip,
+                              protocol="fw100" if self.kind == "udp" else None,
+                              proto="serial" if self.kind == "serial" else "udp")
+            src.start()
+            self.result_source = src
+            self.ready.emit((src, self.kind, self.com, self.baud,
+                             self.target_ip, self.port))
+        except Exception as exc:  # noqa: BLE001 - 错误传回主线程显示
+            if src is not None:
+                try:
+                    src.stop()
+                except Exception:
+                    pass
+            self.failed.emit(str(exc))
+
+
 class ClassicMainWindow(QtWidgets.QMainWindow):
     def __init__(self):
         super().__init__()
@@ -14,6 +47,7 @@ class ClassicMainWindow(QtWidgets.QMainWindow):
         self.setWindowTitle(self._base_title)
         self.resize(1600, 950)
         self.source = None          # 由 main() 注入或界面"连接"按钮创建, 用于读链路统计
+        self._connection_worker = None
         self._link_error = None     # 打开失败的原文: 定时刷新不许把它冲掉
         self._link_t0 = time.time()
         cw = QtWidgets.QWidget(); self.setCentralWidget(cw)
@@ -137,6 +171,7 @@ class ClassicMainWindow(QtWidgets.QMainWindow):
         self.cmb_com.setMinimumWidth(90)
         self.cmb_baud = QtWidgets.QComboBox(); self.cmb_baud.setEditable(True)
         self.cmb_baud.addItems(["921600", "460800", "230400", "115200"])
+        self.lbl_com = QtWidgets.QLabel("控制串口")
         self.lbl_udp_ip = QtWidgets.QLabel("ESP IP")
         self.ed_udp_ip = QtWidgets.QLineEdit()
         self.ed_udp_ip.setPlaceholderText("WIFI STATUS 的 ip，如 192.168.3.140")
@@ -153,7 +188,8 @@ class ClassicMainWindow(QtWidgets.QMainWindow):
         self.btn_conn.clicked.connect(self._toggle_link)
         r1 = QtWidgets.QHBoxLayout(); r1.addWidget(self.cmb_src, stretch=2)
         r1.addWidget(self.cmb_baud, stretch=1)
-        r2 = QtWidgets.QHBoxLayout(); r2.addWidget(self.cmb_com, stretch=1)
+        r2 = QtWidgets.QHBoxLayout(); r2.addWidget(self.lbl_com)
+        r2.addWidget(self.cmb_com, stretch=1)
         r2.addWidget(self.btn_scan)
         for widget in (self.lbl_udp_ip, self.ed_udp_ip,
                        self.lbl_udp_port, self.ed_udp_port):
@@ -267,25 +303,43 @@ class ClassicMainWindow(QtWidgets.QMainWindow):
         if self.source is None:
             self._connect()
         else:
-            self._disconnect()
+            active = getattr(self.source, "proto", getattr(self.source, "kind", ""))
+            if active == self.cmb_src.currentData():
+                self._disconnect()
+            else:
+                self._connect()
 
     def _update_connection_fields(self, _index=None):
-        udp = self.cmb_src.currentData() == "udp"
-        for widget in (self.cmb_com, self.cmb_baud, self.btn_scan):
-            widget.setVisible(not udp)
+        kind = self.cmb_src.currentData()
+        udp = kind == "udp"
+        control = kind in ("udp", "serial", "text")
+        for widget in (self.lbl_com, self.cmb_com, self.cmb_baud, self.btn_scan):
+            widget.setVisible(control)
+        self.lbl_com.setText("控制串口" if udp else "串口")
         for widget in (self.lbl_udp_ip, self.ed_udp_ip,
                        self.lbl_udp_port, self.ed_udp_port):
             widget.setVisible(udp)
         if self.source is None:
             self.btn_conn.setText("▶ 接收 EEG" if udp else "▶ 连接并采集")
+        elif getattr(self.source, "proto", getattr(self.source, "kind", "")) != kind:
+            self.btn_conn.setText("↪ 切换并连接")
 
     def _connect(self):
         """按界面选项建链路并开采集。失败原因直接显示在链路行，不让窗口空着。"""
         kind = self.cmb_src.currentData()
-        com = self.cmb_com.currentText().strip() or "COM3"
+        com = self.cmb_com.currentText().strip()
         baud = 921600
         target_ip = None
         port = 5000
+        if kind in ("udp", "serial", "text"):
+            if not com:
+                self.show_link_error("请先选择设备的控制串口 COM 口")
+                return
+            try:
+                baud = int(self.cmb_baud.currentText().strip() or 921600)
+            except ValueError:
+                self.show_link_error("波特率必须是整数")
+                return
         if kind == "udp":
             import ipaddress
             target_ip = self.ed_udp_ip.text().strip()
@@ -297,25 +351,21 @@ class ClassicMainWindow(QtWidgets.QMainWindow):
             except ValueError:
                 self.show_link_error("请输入 WIFI STATUS 中的 ESP IPv4 地址和 1～65535 的 UDP 端口")
                 return
-        else:
-            try:
-                baud = int(self.cmb_baud.currentText().strip() or 921600)
-            except ValueError:
-                self._say(f"[FAIL] 波特率不是整数: {self.cmb_baud.currentText()!r}", False)
-                return
         self._disconnect(silent=True)
-        from source import make_source
         self.mon.extra_cols = False
-        try:
-            src = make_source(kind, com=com, baud=baud, port=port, host="0.0.0.0",
-                              target_ip=target_ip,
-                              protocol="fw100" if kind == "udp" else None,
-                              proto=("serial" if kind == "serial" else "udp"))
-            src.start()
-        except Exception as e:  # noqa: BLE001 - 打不开端口是最常见的现场故障
-            self._say(f"[FAIL] 连接失败({kind}): {e}", False)
-            self.show_link_error(str(e))
-            return
+        self._connection_worker = _ConnectionWorker(kind, com, baud, port, target_ip, self)
+        self._connection_worker.ready.connect(self._connection_ready)
+        self._connection_worker.failed.connect(self._connection_failed)
+        self._connection_worker.finished.connect(self._connection_finished)
+        self.btn_conn.setEnabled(False)
+        for widget in (self.cmb_src, self.cmb_com, self.cmb_baud, self.btn_scan,
+                       self.ed_udp_ip, self.ed_udp_port):
+            widget.setEnabled(False)
+        self.lbl_link.setText("链路: 正在切换设备模式并连接…")
+        self._connection_worker.start()
+
+    def _connection_ready(self, result):
+        src, kind, com, baud, target_ip, port = result
         self._install_source(src)
         where = (f"{com} @{baud}" if kind in ("text", "serial") else
                  f"{target_ip}:{port}" if kind == "udp" else kind)
@@ -325,6 +375,21 @@ class ClassicMainWindow(QtWidgets.QMainWindow):
             # 驱动允许两个句柄，但字节会被分流，出来的是跳变脏值, 不是传感器数据。
             self._say("[注意] 同一 COM 口若被 VOFA 等工具同时打开，数据会被分流成跳变脏值；"
                       "测完整波形前请先断开那些工具", False)
+
+    def _connection_failed(self, error):
+        self._say(f"[FAIL] 模式切换或连接失败: {error}", False)
+        self.show_link_error(error)
+
+    def _connection_finished(self):
+        worker = self._connection_worker
+        self._connection_worker = None
+        if worker is not None:
+            worker.deleteLater()
+        self.btn_conn.setEnabled(True)
+        for widget in (self.cmb_src, self.cmb_com, self.cmb_baud, self.btn_scan,
+                       self.ed_udp_ip, self.ed_udp_port):
+            widget.setEnabled(True)
+        self._update_connection_fields()
 
     def _disconnect(self, silent: bool = False):
         if self.source is not None:
@@ -727,6 +792,17 @@ class ClassicMainWindow(QtWidgets.QMainWindow):
         self._worker = Worker(self)
         self._worker.line.connect(lambda t, ok: self._say(("PASS " if ok else "FAIL ") + t, ok))
         self._worker.start(); return "后台逐项验证中…"
+
+    def closeEvent(self, event):
+        worker = self._connection_worker
+        if worker is not None and worker.isRunning():
+            worker.wait()
+        if worker is not None:
+            pending = getattr(worker, "result_source", None)
+            if pending is not None and pending is not self.source:
+                pending.stop()
+        self._disconnect(silent=True)
+        super().closeEvent(event)
 
 
 MainWindow = ClassicMainWindow

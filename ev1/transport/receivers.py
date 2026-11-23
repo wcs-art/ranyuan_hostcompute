@@ -20,6 +20,42 @@ class LinkError(RuntimeError):
     """链路打开失败。message 是给现场看的中文原因。"""
 
 
+def _send_eeg_command(ser, command: str, expected: bytes, timeout_s: float) -> None:
+    """在 USART1 上发文本命令并确认固件回复，跳过可能混入的二进制帧。"""
+    ser.reset_input_buffer()
+    ser.write(command.encode("ascii") + b"\r\n")
+    ser.flush()
+    deadline = time.monotonic() + timeout_s
+    received = bytearray()
+    while time.monotonic() < deadline:
+        chunk = ser.read(min(max(ser.in_waiting, 1), 512))
+        if not chunk:
+            continue
+        received.extend(chunk)
+        if expected in received:
+            return
+        if b"ERR EEG OUTPUT" in received:
+            tail = received.split(b"ERR EEG OUTPUT", 1)[1].split(b"\n", 1)[0]
+            raise LinkError(f"固件拒绝 {command}: ERR EEG OUTPUT{tail.decode('ascii', 'replace')}")
+        del received[:-4096]
+    raise LinkError(f"{command} 已发送，但 {timeout_s:g}s 内没有收到固件确认；请检查控制串口和波特率")
+
+
+def request_eeg_udp_mode(com: str, baud: int) -> None:
+    """临时占用控制串口，确认切到 UDP 后立即释放，供无线接收器使用。"""
+    try:
+        import serial
+    except ImportError as exc:
+        raise LinkError("切换 UDP 模式需要 pyserial，请安装 pyserial") from exc
+    try:
+        with serial.Serial(com, baud, timeout=0.2, write_timeout=2) as ser:
+            _send_eeg_command(ser, "EEG OUTPUT UDP", b"OK EEG OUTPUT UDP result=0", 8.0)
+    except LinkError:
+        raise
+    except Exception as exc:
+        raise LinkError(f"控制串口 {com} 无法发送 EEG OUTPUT UDP: {exc}") from exc
+
+
 class _ByteReceiver:
     """所有接收器的公共骨架: 队列 + 统计 + 停止。"""
 
@@ -456,7 +492,7 @@ class SerialReceiver(_ByteReceiver):
         except ImportError as e:
             raise LinkError("缺少 pyserial, 无法使用 Type-C 串口链路: pip install pyserial") from e
         try:
-            return serial.Serial(self.com, self.baud, timeout=0.2)
+            ser = serial.Serial(self.com, self.baud, timeout=0.2, write_timeout=2)
         except Exception as e:  # noqa: BLE001 - pyserial 抛的异常类型很杂
             raw = str(e)
             # Windows 串口是独占的: 别的程序正开着这个口时报的是 PermissionError,
@@ -472,6 +508,15 @@ class SerialReceiver(_ByteReceiver):
             else:
                 why = f"串口 {self.com} 打不开。"
             raise LinkError(f"{why} 原始错误: {raw}") from e
+        try:
+            _send_eeg_command(ser, "EEG OUTPUT UART", b"OK EEG OUTPUT UART result=0", 3.0)
+            _send_eeg_command(ser, "EEG UART ON", b"OK EEG UART ON", 3.0)
+        except Exception as exc:
+            ser.close()
+            if isinstance(exc, LinkError):
+                raise
+            raise LinkError(f"串口 {self.com} 模式命令发送失败: {exc}") from exc
+        return ser
 
     def start(self) -> None:
         if self.running:  # 幂等: 入口与界面可能各调一次
