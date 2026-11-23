@@ -3,8 +3,10 @@ from __future__ import annotations
 from typing import Optional, Union
 
 import socket
+import struct
 import threading
 import time
+import ipaddress
 from collections import deque
 
 #: UDP 单包上限。原值 8192 会在模组攒包时截断(100帧/秒×90B≈9KB), 导致整包 CRC 全错。
@@ -109,6 +111,151 @@ class UdpReceiver(_ByteReceiver):
                 self._push(data)
 
         threading.Thread(target=_loop, daemon=True, name="udp-rx").start()
+
+
+class EspUdpReceiver(_ByteReceiver):
+    """当前 ESP8285 固件：从同一本机 UDP 端口发 HELLO/START 并接收 100B 批帧。"""
+
+    kind = "udp-eeg"
+
+    def __init__(self, target_ip: str, port: int = 5000, bufsize: int = MAX_DGRAM):
+        super().__init__(bufsize)
+        try:
+            self.target_ip = str(ipaddress.IPv4Address(target_ip))
+        except ipaddress.AddressValueError as exc:
+            raise LinkError(f"ESP IP 不是有效的 IPv4 地址: {target_ip!r}") from exc
+        self.port = int(port)
+        if self.target_ip == "0.0.0.0" or not 1 <= self.port <= 65535:
+            raise LinkError("请填写 ESP 的实际 IPv4 地址和 1～65535 的 UDP 端口")
+        self.target = (self.target_ip, self.port)
+        self.local_port = 0
+        self.phase = "未连接"
+        self.test_sequences: set[int] = set()
+        self.test_packets = 0
+        self.invalid_packets = 0
+        self.foreign_packets = 0
+        self.port_unreachable = 0
+        self.reconnects = 0
+        self.last_send_fail = None
+        self.last_dropped = None
+        self._last_hello = 0.0
+        self._last_start = 0.0
+        self._last_eeg = 0.0
+        self._streaming = False
+
+    def _send(self, payload: bytes) -> None:
+        sk = self._sk
+        if sk is None:
+            return
+        try:
+            sk.sendto(payload, self.target)
+        except OSError as exc:
+            if self.running:
+                self.error = f"发送 {payload.decode('ascii')} 失败: {exc}"
+
+    def _hello(self) -> None:
+        self.test_sequences.clear()
+        self._streaming = False
+        self.phase = "等待测试包"
+        self._send(b"HELLO")
+        self._last_hello = time.monotonic()
+
+    def _start_stream(self) -> None:
+        self._send(b"START")
+        self._last_start = time.monotonic()
+        self.phase = "等待 EEG"
+
+    def start(self) -> None:
+        if self.running:
+            return
+        sk = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            # ESP 把测试包和 EEG 都回送到 HELLO 的来源端口，不能绑定 ESP 的 5000 端口。
+            sk.bind(("0.0.0.0", 0))
+            sk.settimeout(0.2)
+        except OSError as exc:
+            sk.close()
+            raise LinkError(f"本机 UDP 接收端口无法打开: {exc}") from exc
+        self._sk = sk
+        self.local_port = sk.getsockname()[1]
+        self.running = True
+        self.error = None
+        self._hello()
+        threading.Thread(target=self._loop, daemon=True, name="esp-udp-rx").start()
+
+    def _loop(self) -> None:
+        sk = self._sk
+        while self.running:
+            now = time.monotonic()
+            if len(self.test_sequences) < 10 and now - self._last_hello >= 5.0:
+                self._hello()
+            elif len(self.test_sequences) == 10 and not self._streaming and now - self._last_start >= 1.0:
+                self._start_stream()
+            elif self._streaming and now - self._last_eeg >= 3.0:
+                self.reconnects += 1
+                self._hello()
+            try:
+                data, addr = sk.recvfrom(self.bufsize)
+            except socket.timeout:
+                continue
+            except OSError as exc:
+                if getattr(exc, "winerror", None) == 10054 or exc.errno == 10054:
+                    # Windows 会把对端端口不可达报告给下一次 recvfrom；继续重试 HELLO。
+                    self.port_unreachable += 1
+                    continue
+                if self.running:
+                    self.error = f"UDP 接收中断: {exc}"
+                break
+            self._handle_datagram(data, addr)
+        self.running = False
+
+    def _handle_datagram(self, data: bytes, addr: tuple[str, int]) -> None:
+        # ESP 的回包源端口由模组 socket 决定；与联调脚本一致，只核对来源 IP。
+        if addr[0] != self.target_ip:
+            self.foreign_packets += 1
+            return
+        if len(data) in (16, 32, 48) and data[:4] == b"RY\x01\x01":
+            seq, _, marker = struct.unpack_from("<III", data, 4)
+            if marker != 0xA55A3CC3 or seq >= 10:
+                self.invalid_packets += 1
+                return
+            self.test_packets += 1
+            self.test_sequences.add(seq)
+            if len(data) >= 32:
+                self.last_send_fail, _, _, self.last_dropped = struct.unpack_from("<IIII", data, 16)
+            if len(self.test_sequences) == 10 and not self._last_start:
+                self._start_stream()
+            return
+        if len(self.test_sequences) < 10:
+            self.invalid_packets += 1
+            return
+        if len(data) < 100 or len(data) % 100 or data[:2] != b"\xAA\x55":
+            self.invalid_packets += 1
+            return
+        self._streaming = True
+        self.phase = "接收 EEG"
+        self._last_eeg = time.monotonic()
+        self.error = None
+        self._push(data)  # 一包可包含 1～10 个完整帧；后续统一走 fw100 CRC 解包。
+
+    def stats(self) -> dict:
+        info = super().stats()
+        info.update({"peer": f"{self.target_ip}:{self.port}",
+                     "local_port": self.local_port, "phase": self.phase,
+                     "tests": len(self.test_sequences), "test_packets": self.test_packets,
+                     "invalid_packets": self.invalid_packets,
+                     "foreign_packets": self.foreign_packets,
+                     "port_unreachable": self.port_unreachable,
+                     "reconnects": self.reconnects,
+                     "mcu_send_fail": self.last_send_fail,
+                     "mcu_dropped": self.last_dropped})
+        return info
+
+    def stop(self) -> None:
+        if self.running and self._sk is not None and self.test_sequences:
+            self._send(b"STOP")
+        super().stop()
+        self.phase = "已断开"
 
 
 class TcpReceiver(_ByteReceiver):
@@ -351,10 +498,13 @@ class SerialReceiver(_ByteReceiver):
 
 
 def make_receiver(proto: str = "udp", port: int = 5000, host: str = "0.0.0.0",
-                  com: str = "COM3", baud: int = 921600) -> _ByteReceiver:
+                  com: str = "COM3", baud: int = 921600,
+                  target_ip: Optional[str] = None) -> _ByteReceiver:
     """按链路类型造接收器。proto 取值见模块头注释。"""
     p = (proto or "udp").lower()
     if p == "udp":
+        if target_ip:
+            return EspUdpReceiver(target_ip=target_ip, port=port)
         return UdpReceiver(port=port, host=host)
     if p == "tcp":
         return TcpReceiver(port=port, host=host)

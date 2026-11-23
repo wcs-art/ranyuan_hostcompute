@@ -1,8 +1,8 @@
 {
   "_说明": "上位机默认连接参数。双击 run.bat 时按这里的配置启动；命令行参数优先级更高。",
-  "_改法": "当前 RanYuan_Test_1116 固件上电默认从 USART1 输出 100 字节二进制帧。改 com 为实际端口；切到无线时再改 proto。",
+  "_改法": "当前固件上电默认选择 USART1 但不发数据帧；串口模式需发送 EEG UART ON。无线模式先发送 EEG OUTPUT UDP，界面选 EEG UDP，填写 ESP 的 IP 和 UDP 端口 5000。",
   "_示例_模拟数据自检": {"source": "sim"},
-  "_示例_模组UDP透传": {"source": "real", "proto": "udp", "port": 5000, "host": "0.0.0.0"},
+  "_示例_模组UDP透传": {"source": "real", "proto": "udp", "target_ip": "<ESP当前IP>", "port": 5000},
   "_示例_模组TCP服务端": {"source": "real", "proto": "tcp-client", "host": "192.168.4.1", "port": 8080},
   "_示例_TypeC串口": {"source": "real", "proto": "serial", "com": "COM3", "baud": 921600},
   "_协议": "protocol=fw100 对应当前固件 100 字节帧(dev/ver/flags/seq/time/EEG/fNIRS/event/CRC); v1 是 104 字节合同布局; v1r5 是 152 字节; compat90 是旧版 90 字节布局",
@@ -13,6 +13,7 @@
   "proto": "serial",
   "port": 5000,
   "host": "0.0.0.0",
+  "target_ip": "",
   "com": "COM18",
   "baud": 921600,
   "raw_dump": "capture/field.bin",
