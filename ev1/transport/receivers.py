@@ -128,6 +128,7 @@ class EspUdpReceiver(_ByteReceiver):
         if self.target_ip == "0.0.0.0" or not 1 <= self.port <= 65535:
             raise LinkError("请填写 ESP 的实际 IPv4 地址和 1～65535 的 UDP 端口")
         self.target = (self.target_ip, self.port)
+        self.local_ip = ""
         self.local_port = 0
         self.phase = "未连接"
         self.test_sequences: set[int] = set()
@@ -139,9 +140,38 @@ class EspUdpReceiver(_ByteReceiver):
         self.last_send_fail = None
         self.last_dropped = None
         self._last_hello = 0.0
+        self._last_test_rx = 0.0
         self._last_start = 0.0
         self._last_eeg = 0.0
         self._streaming = False
+
+    def _wireless_ip(self) -> str:
+        """只选与 ESP 同网段、已连接的无线 IPv4，避免双网卡时走有线。"""
+        try:
+            import psutil
+        except ImportError as exc:
+            raise LinkError("EEG UDP 需要 psutil 来识别无线网卡，请安装 psutil") from exc
+
+        names = ("wlan", "wi-fi", "wifi", "wireless", "无线")
+        target = ipaddress.IPv4Address(self.target_ip)
+        addresses = psutil.net_if_addrs()
+        for name, state in psutil.net_if_stats().items():
+            if not state.isup or not any(part in name.lower() for part in names):
+                continue
+            for addr in addresses.get(name, ()):
+                if addr.family != socket.AF_INET or not addr.netmask:
+                    continue
+                try:
+                    local = ipaddress.IPv4Address(addr.address)
+                    network = ipaddress.IPv4Network(
+                        f"{addr.address}/{addr.netmask}", strict=False)
+                except ipaddress.AddressValueError:
+                    continue
+                if not local.is_link_local and target in network:
+                    return str(local)
+        raise LinkError(
+            f"没有找到与 ESP {self.target_ip} 同网段且已连接的无线网卡；"
+            "请连接 WLAN 后重试，EEG UDP 不会改走以太网")
 
     def _send(self, payload: bytes) -> None:
         sk = self._sk
@@ -153,8 +183,13 @@ class EspUdpReceiver(_ByteReceiver):
             if self.running:
                 self.error = f"发送 {payload.decode('ascii')} 失败: {exc}"
 
-    def _hello(self) -> None:
-        self.test_sequences.clear()
+    def _hello(self, reset_tests: bool = False) -> None:
+        # 重发 HELLO 时保留已收到的序号，避免少量 UDP 丢包让握手永远达不到 10/10。
+        # 仅首次连接和流中断后的新一轮握手清空旧序号。
+        if reset_tests:
+            self.test_sequences.clear()
+            self._last_test_rx = 0.0
+            self._last_start = 0.0
         self._streaming = False
         self.phase = "等待测试包"
         self._send(b"HELLO")
@@ -168,10 +203,11 @@ class EspUdpReceiver(_ByteReceiver):
     def start(self) -> None:
         if self.running:
             return
+        self.local_ip = self._wireless_ip()
         sk = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         try:
             # ESP 把测试包和 EEG 都回送到 HELLO 的来源端口，不能绑定 ESP 的 5000 端口。
-            sk.bind(("0.0.0.0", 0))
+            sk.bind((self.local_ip, 0))
             sk.settimeout(0.2)
         except OSError as exc:
             sk.close()
@@ -180,20 +216,22 @@ class EspUdpReceiver(_ByteReceiver):
         self.local_port = sk.getsockname()[1]
         self.running = True
         self.error = None
-        self._hello()
+        self._hello(reset_tests=True)
         threading.Thread(target=self._loop, daemon=True, name="esp-udp-rx").start()
 
     def _loop(self) -> None:
         sk = self._sk
         while self.running:
             now = time.monotonic()
-            if len(self.test_sequences) < 10 and now - self._last_hello >= 5.0:
+            # 固件逐个发送测试包，发送过程可能超过 5 秒；有新序号到达就等待。
+            if (len(self.test_sequences) < 10 and
+                    now - max(self._last_hello, self._last_test_rx) >= 5.0):
                 self._hello()
             elif len(self.test_sequences) == 10 and not self._streaming and now - self._last_start >= 1.0:
                 self._start_stream()
             elif self._streaming and now - self._last_eeg >= 3.0:
                 self.reconnects += 1
-                self._hello()
+                self._hello(reset_tests=True)
             try:
                 data, addr = sk.recvfrom(self.bufsize)
             except socket.timeout:
@@ -220,6 +258,8 @@ class EspUdpReceiver(_ByteReceiver):
                 self.invalid_packets += 1
                 return
             self.test_packets += 1
+            if seq not in self.test_sequences:
+                self._last_test_rx = time.monotonic()
             self.test_sequences.add(seq)
             if len(data) >= 32:
                 self.last_send_fail, _, _, self.last_dropped = struct.unpack_from("<IIII", data, 16)
@@ -241,6 +281,7 @@ class EspUdpReceiver(_ByteReceiver):
     def stats(self) -> dict:
         info = super().stats()
         info.update({"peer": f"{self.target_ip}:{self.port}",
+                     "local_ip": self.local_ip,
                      "local_port": self.local_port, "phase": self.phase,
                      "tests": len(self.test_sequences), "test_packets": self.test_packets,
                      "invalid_packets": self.invalid_packets,

@@ -11,7 +11,8 @@ fNIRS 绘在右侧 mM 轴，共用时间轴；下方通道勾选框控制两页�
 当前 ESP8285 固件走 UDP 时，先从调试串口发送 `EEG OUTPUT UDP`，等 `UDP READY`，
 再查询 `WIFI STATUS` 取得 ESP IP。电脑接入同一个 Wi-Fi，在底部选择
 “EEG UDP (ESP8285)”，输入该 IP 和 UDP 端口 `5000`，点击“接收 EEG”。
-上位机会用本机自动分配的
+上位机需要 `psutil`，会选择与 ESP 同网段且已连接的无线网卡；未连接无线时会报错，
+不会改走以太网。它会用本机自动分配的
 端口发送 `HELLO`，收齐 10 个测试包后发送 `START`，再按与串口相同的 `fw100`
 布局校验 CRC 并显示 4 路 EEG；底部链路标签显示握手进度、帧数和错误计数。
 没有 fNIRS 采集板时，固件帧内 fNIRS 字段仍为零。若固件从 ISON 自动回退到
@@ -22,6 +23,7 @@ Redmi K60 Ultra，ESP 的 IP 会变化，电脑也需切到对应网络并重新
 
 ### 源码运行
 ```
+.venv\Scripts\python.exe -m pip install psutil
 .venv\Scripts\python.exe main.py
 ```
 

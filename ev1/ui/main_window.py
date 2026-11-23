@@ -450,7 +450,8 @@ class ClassicMainWindow(QtWidgets.QMainWindow):
         if link == "tcp-client":
             extra = f" [{'已连接' if st.get('connected') else '未连接'} {st.get('peer','')}]"
         elif link == "udp-eeg":
-            extra = f" {st.get('peer', '')} ← 本机:{st.get('local_port', '?')}"
+            extra = (f" {st.get('peer', '')} ← 无线"
+                     f" {st.get('local_ip', '?')}:{st.get('local_port', '?')}")
         elif link == "serial":
             extra = ""
         else:
