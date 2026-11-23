@@ -10,7 +10,7 @@ class ClassicMainWindow(QtWidgets.QMainWindow):
         super().__init__()
         # 构建标记：重启后看标题栏即可确认跑的是不是新代码（改源码不会影响
         # 已启动的进程，也不会更新 dist 里旧 exe；看到这个标记才说明重载成功）。
-        self._base_title = "燃元科技数据采集显示上位机  [build 2026-11-23 xaxis-nonneg]"
+        self._base_title = "燃元科技数据采集显示上位机  [build 2026-11-23 udp-pagination]"
         self.setWindowTitle(self._base_title)
         self.resize(1600, 950)
         self.source = None          # 由 main() 注入或界面"连接"按钮创建, 用于读链路统计
@@ -50,10 +50,13 @@ class ClassicMainWindow(QtWidgets.QMainWindow):
         # 显示切换 S1
         g1 = QtWidgets.QGroupBox("EEG/fNIRS 显示 (S1)"); f1 = QtWidgets.QVBoxLayout(g1)
         self.cmb_fnirs = QtWidgets.QComboBox(); self.cmb_fnirs.addItems(["ΔHbO2", "ΔHbR"])
-        self.cmb_fnirs.currentIndexChanged.connect(lambda i: setattr(self.mon, "show_hbo", i == 0))
+        self.cmb_fnirs.currentIndexChanged.connect(self.mon._set_fnirs_metric)
+        self.mon.cmb_fnirs.currentIndexChanged.connect(self.cmb_fnirs.setCurrentIndex)
         self.cmb_win = QtWidgets.QComboBox(); self.cmb_win.addItems(["5s", "10s", "30s"])
         self.cmb_win.setCurrentIndex(1)
-        self.cmb_win.currentIndexChanged.connect(lambda i: setattr(self.mon, "win_s", (5, 10, 30)[i]))
+        self.cmb_win.currentIndexChanged.connect(
+            lambda i: self.mon._set_win(self.mon.WIN_CHOICES.index((5.0, 10.0, 30.0)[i])))
+        self.mon.cmb_win.currentIndexChanged.connect(self._sync_window_choice)
         f1.addWidget(QtWidgets.QLabel("fNIRS 默认ΔHbO2, 可切ΔHbR (S1)")); f1.addWidget(self.cmb_fnirs)
         f1.addWidget(QtWidgets.QLabel("时间窗")); f1.addWidget(self.cmb_win)
         self.btn_pause = QtWidgets.QPushButton("暂停/继续 (S1)")
@@ -126,7 +129,7 @@ class ClassicMainWindow(QtWidgets.QMainWindow):
         self.cmb_src = QtWidgets.QComboBox()
         for label, key in (("文本串口 (有线 FireWater)", "text"),
                            ("二进制串口 (AA55 帧)", "serial"),
-                           ("UDP 网络", "udp"),
+                           ("EEG UDP (ESP8285)", "udp"),
                            ("TCP 服务端", "tcp-client"),
                            ("模拟数据 (仅自检)", "sim")):
             self.cmb_src.addItem(label, key)
@@ -134,6 +137,14 @@ class ClassicMainWindow(QtWidgets.QMainWindow):
         self.cmb_com.setMinimumWidth(90)
         self.cmb_baud = QtWidgets.QComboBox(); self.cmb_baud.setEditable(True)
         self.cmb_baud.addItems(["921600", "460800", "230400", "115200"])
+        self.lbl_udp_ip = QtWidgets.QLabel("ESP IP")
+        self.ed_udp_ip = QtWidgets.QLineEdit()
+        self.ed_udp_ip.setPlaceholderText("WIFI STATUS 的 ip，如 192.168.3.140")
+        self.ed_udp_ip.setMinimumWidth(145)
+        self.lbl_udp_port = QtWidgets.QLabel("端口")
+        self.ed_udp_port = QtWidgets.QLineEdit("5000")
+        self.ed_udp_port.setMaximumWidth(65)
+        self.ed_udp_port.setToolTip("ESP 的 UDP 端口；本机接收端口自动分配")
         self.btn_scan = QtWidgets.QPushButton("刷新端口")
         self.btn_scan.clicked.connect(self._rescan_ports)
         self.btn_conn = QtWidgets.QPushButton("▶ 连接并采集")
@@ -144,10 +155,15 @@ class ClassicMainWindow(QtWidgets.QMainWindow):
         r1.addWidget(self.cmb_baud, stretch=1)
         r2 = QtWidgets.QHBoxLayout(); r2.addWidget(self.cmb_com, stretch=1)
         r2.addWidget(self.btn_scan)
+        for widget in (self.lbl_udp_ip, self.ed_udp_ip,
+                       self.lbl_udp_port, self.ed_udp_port):
+            r2.addWidget(widget)
         conn_box.addLayout(r1); conn_box.addLayout(r2)
         bl.addLayout(conn_box, stretch=2)
         bl.addWidget(self.btn_conn)
         self._rescan_ports()
+        self.cmb_src.currentIndexChanged.connect(self._update_connection_fields)
+        self._update_connection_fields()
 
         rec_box = QtWidgets.QVBoxLayout()
         self.btn_record = QtWidgets.QPushButton("● 开始记录 (S2)")
@@ -253,20 +269,47 @@ class ClassicMainWindow(QtWidgets.QMainWindow):
         else:
             self._disconnect()
 
+    def _update_connection_fields(self, _index=None):
+        udp = self.cmb_src.currentData() == "udp"
+        for widget in (self.cmb_com, self.cmb_baud, self.btn_scan):
+            widget.setVisible(not udp)
+        for widget in (self.lbl_udp_ip, self.ed_udp_ip,
+                       self.lbl_udp_port, self.ed_udp_port):
+            widget.setVisible(udp)
+        if self.source is None:
+            self.btn_conn.setText("▶ 接收 EEG" if udp else "▶ 连接并采集")
+
     def _connect(self):
         """按界面选项建链路并开采集。失败原因直接显示在链路行，不让窗口空着。"""
         kind = self.cmb_src.currentData()
         com = self.cmb_com.currentText().strip() or "COM3"
-        try:
-            baud = int(self.cmb_baud.currentText().strip() or 921600)
-        except ValueError:
-            self._say(f"[FAIL] 波特率不是整数: {self.cmb_baud.currentText()!r}", False)
-            return
+        baud = 921600
+        target_ip = None
+        port = 5000
+        if kind == "udp":
+            import ipaddress
+            target_ip = self.ed_udp_ip.text().strip()
+            try:
+                ipaddress.IPv4Address(target_ip)
+                port = int(self.ed_udp_port.text().strip())
+                if target_ip == "0.0.0.0" or not 1 <= port <= 65535:
+                    raise ValueError("地址或端口超出范围")
+            except ValueError:
+                self.show_link_error("请输入 WIFI STATUS 中的 ESP IPv4 地址和 1～65535 的 UDP 端口")
+                return
+        else:
+            try:
+                baud = int(self.cmb_baud.currentText().strip() or 921600)
+            except ValueError:
+                self._say(f"[FAIL] 波特率不是整数: {self.cmb_baud.currentText()!r}", False)
+                return
         self._disconnect(silent=True)
         from source import make_source
         self.mon.extra_cols = False
         try:
-            src = make_source(kind, com=com, baud=baud, port=5000, host="0.0.0.0",
+            src = make_source(kind, com=com, baud=baud, port=port, host="0.0.0.0",
+                              target_ip=target_ip,
+                              protocol="fw100" if kind == "udp" else None,
                               proto=("serial" if kind == "serial" else "udp"))
             src.start()
         except Exception as e:  # noqa: BLE001 - 打不开端口是最常见的现场故障
@@ -274,7 +317,8 @@ class ClassicMainWindow(QtWidgets.QMainWindow):
             self.show_link_error(str(e))
             return
         self._install_source(src)
-        where = f"{com} @{baud}" if kind in ("text", "serial") else kind
+        where = (f"{com} @{baud}" if kind in ("text", "serial") else
+                 f"{target_ip}:{port}" if kind == "udp" else kind)
         self._say(f"[OK] 已连接: {self.cmb_src.currentText()} — {where}")
         if kind in ("text", "serial"):
             # 现场最容易犯的一条：VOFA/串口助手和上位机同时开同一个口。
@@ -297,7 +341,8 @@ class ClassicMainWindow(QtWidgets.QMainWindow):
         self.lbl_link.setText("链路: 未连接（选好类型和端口后点「连接并采集」）")
         self.lbl_link.setStyleSheet("color:#666666;")
         if hasattr(self, "btn_conn"):
-            self.btn_conn.setText("▶ 连接并采集")
+            self.btn_conn.setText("▶ 接收 EEG" if self.cmb_src.currentData() == "udp"
+                                  else "▶ 连接并采集")
         if not silent:
             self._say("已断开数据源")
 
@@ -311,6 +356,12 @@ class ClassicMainWindow(QtWidgets.QMainWindow):
         import re
         text = str(msg)
         low = text.lower()
+        if self.cmb_src.currentData() == "udp":
+            self.lbl_link.setText(f"链路: 打开失败 — {text}\n⚠ 检查 ESP IP、UDP 端口、电脑网段和防火墙")
+            self.lbl_link.setStyleSheet("color:#b00020;")
+            self.btn_conn.setText("▶ 接收 EEG")
+            self._link_error = text
+            return
         tip = "检查线缆、驱动与口名后重试；也可点「刷新端口」重新扫描"
         m = re.search(r"(COM\d+)", text, re.I)
         if m:
@@ -370,6 +421,10 @@ class ClassicMainWindow(QtWidgets.QMainWindow):
         baud = getattr(src, "baud", None)
         if baud:
             self.cmb_baud.setCurrentText(str(int(baud)))
+        target_ip = getattr(src, "target_ip", None)
+        if target_ip:
+            self.ed_udp_ip.setText(str(target_ip))
+            self.ed_udp_port.setText(str(getattr(getattr(src, "_rx", None), "port", 5000)))
 
     def _refresh_link(self):
         """刷新链路行：区分「没有包」「有包但没帧」「有错误」三种情况。"""
@@ -394,6 +449,8 @@ class ClassicMainWindow(QtWidgets.QMainWindow):
         extra = ""
         if link == "tcp-client":
             extra = f" [{'已连接' if st.get('connected') else '未连接'} {st.get('peer','')}]"
+        elif link == "udp-eeg":
+            extra = f" {st.get('peer', '')} ← 本机:{st.get('local_port', '?')}"
         elif link == "serial":
             extra = ""
         else:
@@ -402,6 +459,14 @@ class ClassicMainWindow(QtWidgets.QMainWindow):
 
         base = (f"链路: {link}{extra} | 收包 {pkts} 个 / {st.get('bytes', 0)} 字节 | "
                 f"解出 {frames} 帧 | {fps:.1f} Hz")
+        if link == "udp-eeg":
+            base += f" | 测试包 {st.get('tests', 0)}/10 | {st.get('phase', '')}"
+            if st.get("invalid_packets"):
+                base += f" | 无效 UDP 包 {st['invalid_packets']}"
+            if st.get("port_unreachable"):
+                base += f" | 端口不可达 {st['port_unreachable']}"
+            if st.get("mcu_send_fail"):
+                base += f" | MCU 发送失败 {st['mcu_send_fail']}"
         # 帧头通道数与配置不符 = 切帧边界本身就是错的, 这种帧即使偶过 CRC 也不能用;
         # 不显示出来的话, 现场只会看到"有波形但是在乱跳", 查不到根因。
         hdr_bad = int(st.get("hdr_bad") or 0)
@@ -421,11 +486,22 @@ class ClassicMainWindow(QtWidgets.QMainWindow):
                                         "固件布局和代码里的 FrameLayout 不是同一套, "
                                         "先跑 tools/hexdump_frames.py 确认真实帧长")
             self.lbl_link.setStyleSheet("color:#c25e00;")
+        elif link == "udp-eeg" and st.get("phase") != "接收 EEG":
+            if st.get("tests", 0) < 10:
+                tip = ("等待 ESP 的 10 个测试包：确认固件已发 EEG OUTPUT UDP、"
+                       "串口出现 UDP READY，且电脑与 ESP 在同一网络")
+            else:
+                tip = "测试包已收齐，正在重发 START 等待 EEG；检查固件 EEG STATUS"
+            if st.get("port_unreachable"):
+                tip += "；目标端口不可达，请核对 ESP IP/端口"
+            self.lbl_link.setText(base + "\n… " + tip)
+            self.lbl_link.setStyleSheet("color:#8a6d00;")
         elif idle is not None and idle > 3.0:
             # 串口一直开着、read 也不报错, 但板子已经不发了 —— 这时原实现显示绿字,
             # 现场看到的是"波形停在某个值不动", 会当成界面卡死或算法问题。
-            self.lbl_link.setText(base + f"\n⚠ 已 {idle:.0f}s 没有新数据：链路还连着，但板子没在发"
-                                        "（复位中 / 固件卡住 / 线只供电不传数据）")
+            tip = ("正在重新发送 HELLO 恢复 UDP 流" if link == "udp-eeg" else
+                   "复位中 / 固件卡住 / 线只供电不传数据")
+            self.lbl_link.setText(base + f"\n⚠ 已 {idle:.0f}s 没有新数据：{tip}")
             self.lbl_link.setStyleSheet("color:#c25e00;")
         elif frames > 0:
             self.lbl_link.setText(base)
@@ -479,6 +555,16 @@ class ClassicMainWindow(QtWidgets.QMainWindow):
             b.setChecked(want)
             b.blockSignals(False)
         self.btn_start.setText("已停止 · 启动" if on else "运行中 · 暂停")
+
+    def _sync_window_choice(self, index):
+        """内层时间窗改为外层也有的档位时，让两个选择框保持一致。"""
+        if not (0 <= index < len(self.mon.WIN_CHOICES)):
+            return
+        outer = self.cmb_win.findText(f"{self.mon.WIN_CHOICES[index]:g}s")
+        if outer >= 0 and outer != self.cmb_win.currentIndex():
+            self.cmb_win.blockSignals(True)
+            self.cmb_win.setCurrentIndex(outer)
+            self.cmb_win.blockSignals(False)
 
     def _on_record(self, on):
         self.mon._toggle_record(on)

@@ -152,13 +152,17 @@ class RealSource(Source):
     kind = "real"
 
     def __init__(self, port: int = 5000, proto: str = "udp", host: str = "0.0.0.0",
-                 com: str = "COM3", baud: int = 921600, raw_dump: Optional[Union[str, Path]] = None):
+                 com: str = "COM3", baud: int = 921600,
+                 raw_dump: Optional[Union[str, Path]] = None,
+                 target_ip: Optional[str] = None):
         from receivers import make_receiver
 
         self.proto = proto
         self.com = com
         self.baud = int(baud)
-        self._rx = make_receiver(proto, port=port, host=host, com=com, baud=baud)
+        self.target_ip = target_ip
+        self._rx = make_receiver(proto, port=port, host=host, com=com, baud=baud,
+                                 target_ip=target_ip)
         self._buf = bytearray()
         self._dump = RawDumper(raw_dump) if raw_dump else None
         self.n_frames = 0
@@ -166,6 +170,8 @@ class RealSource(Source):
         self.n_hdr_bad = 0        # 帧头自报的通道数与配置不符: 说明切帧边界本身就是错的
         self._t_first = None
         self._t_last = None
+        self._first_dev_seq = self._first_dev_tick = None
+        self._last_dev_seq = self._last_dev_tick = None
 
     def start(self) -> None:
         self._rx.start()
@@ -192,6 +198,13 @@ class RealSource(Source):
             if not getattr(df, "header_ok", True):
                 self.n_hdr_bad += 1
                 continue
+            if self.proto == "udp" and self.target_ip:
+                # UDP 一包含 10 帧；按包到达的挂钟间隔估计会让 500 SPS 虚高。
+                if self._first_dev_seq is None:
+                    self._first_dev_seq, self._first_dev_tick = df.seq, df.timestamp_ms
+                elif ((df.seq - self._last_dev_seq) & 0xFFFFFFFF) > 0x7FFFFFFF:
+                    self._first_dev_seq, self._first_dev_tick = df.seq, df.timestamp_ms
+                self._last_dev_seq, self._last_dev_tick = df.seq, df.timestamp_ms
             fr = contract.from_protocol(df, t_host_s=time.time())
             frames.append(contract.frame_to_ui_dict(fr))
         if frames:
@@ -204,6 +217,11 @@ class RealSource(Source):
 
     def measured_fps(self) -> float:
         """实测帧率。帧格式/节拍还没冻结时, 以它为准而不是代码里的假设值。"""
+        if self.proto == "udp" and self.target_ip and self._first_dev_seq is not None:
+            seq_span = (self._last_dev_seq - self._first_dev_seq) & 0xFFFFFFFF
+            tick_span = (self._last_dev_tick - self._first_dev_tick) & 0xFFFFFFFF
+            if seq_span and tick_span:
+                return seq_span * 1000.0 / tick_span
         if self._t_first is None or self._t_last is None or self.n_frames < 2:
             return 0.0
         span = self._t_last - self._t_first
@@ -277,7 +295,7 @@ def make_source(kind: str = "real", **kw) -> Source:
     # real 之外, 也允许直接写链路名: --source=tcp-client / --source=serial
     if kind in ("real", "udp", "tcp", "tcp-client", "serial", "uart", "com"):
         opts = {k: v for k, v in kw.items()
-                if k in ("port", "proto", "host", "com", "baud", "raw_dump")}
+                if k in ("port", "proto", "host", "com", "baud", "raw_dump", "target_ip")}
         if kind != "real":
             opts["proto"] = kind
         return RealSource(**opts)
@@ -314,7 +332,8 @@ def parse_argv(argv: list[str], base: Optional[dict] = None) -> dict:
     # 避免现场"看到波形在动就以为板子通了"。(2026-11-12)
     out = {"source": "real", "port": 5000, "proto": "serial", "replay": None,
            "extra_cols": False, "headless": False,
-           "host": "0.0.0.0", "com": "COM3", "baud": 921600, "raw_dump": None,
+           "host": "0.0.0.0", "target_ip": "", "com": "COM3", "baud": 921600,
+           "raw_dump": None,
            # 帧布局与 ADS1299 增益: 合同 F2 要求折算系数随增益联动, 所以增益必须是配置项
            "protocol": "fw100", "eeg_gain": 24.0, "eeg_vref": 4.5,
            # 合同 A3 前置 INA333 G=1000±5%（硬件固定值）。显示值要折算到电极端,
@@ -333,6 +352,8 @@ def parse_argv(argv: list[str], base: Optional[dict] = None) -> dict:
             out["proto"] = a.split("=", 1)[1]
         elif a.startswith("--host="):
             out["host"] = a.split("=", 1)[1]
+        elif a.startswith("--target-ip="):
+            out["target_ip"] = a.split("=", 1)[1]
         elif a.startswith("--com="):
             out["com"] = a.split("=", 1)[1]
         elif a.startswith("--baud="):

@@ -168,6 +168,24 @@ class Monitor14(QtWidgets.QMainWindow):
                   self.btn_verify, self.lbl):
             bar.addWidget(w)
         lay.addLayout(bar)
+        # 主界面顶部信息区：第一项沿用 14 宫格，第二项显示同轴叠加波形。
+        view_row = QtWidgets.QHBoxLayout()
+        self.view_tabs = QtWidgets.QTabBar()
+        self.view_tabs.addTab("14 通道分图")
+        self.view_tabs.addTab("多通道叠加")
+        self.view_tabs.setExpanding(False)
+        view_row.addWidget(self.view_tabs)
+        self.btn_overlay_zoom = QtWidgets.QPushButton("Zoom · 适配当前波形")
+        self.btn_overlay_zoom.setToolTip("按当前时间窗内已勾选的曲线调整左右纵轴；调整后保持固定")
+        self.btn_overlay_zoom.clicked.connect(self._zoom_overlay)
+        self.btn_overlay_reset = QtWidgets.QPushButton("恢复默认比例")
+        self.btn_overlay_reset.clicked.connect(self._reset_overlay_scale)
+        view_row.addWidget(self.btn_overlay_zoom)
+        view_row.addWidget(self.btn_overlay_reset)
+        view_row.addStretch(1)
+        lay.addLayout(view_row)
+        self.btn_overlay_zoom.hide()
+        self.btn_overlay_reset.hide()
         qrow = QtWidgets.QHBoxLayout()
         qrow.addWidget(self.lbl_quality, 1)
         lay.addLayout(qrow)
@@ -341,7 +359,65 @@ class Monitor14(QtWidgets.QMainWindow):
             lambda ev: self._on_plot_click(ev, 0 if self._solo is None else self._solo))
         sl.addWidget(self._big, 1)
         self._stack.addWidget(self._solo_page)
+
+        # 叠加页：左轴只承载 EEG，右轴单独承载 fNIRS，横轴由两个 ViewBox 共享。
+        self._overlay_page = QtWidgets.QWidget()
+        ol = QtWidgets.QVBoxLayout(self._overlay_page)
+        ol.setContentsMargins(0, 0, 0, 0)
+        self._overlay = pg.PlotWidget(axisItems={
+            'left': _RawValueAxis('left'), 'right': _RawValueAxis('right')})
+        self._overlay.showGrid(x=True, y=True)
+        self._overlay.setMouseEnabled(x=True, y=False)
+        self._overlay.setLabel('bottom', '时间', units='s')
+        self._overlay.setLabel('left', 'EEG', units=self.eeg_unit)
+        self._overlay.setLabel('right', 'fNIRS ΔHbO2', units=self.fnirs_unit)
+        self._style_axes(self._overlay)
+        right_axis = self._overlay.getAxis('right')
+        right_axis.enableAutoSIPrefix(False)
+        right_axis.autoSIPrefixScale = 1.0
+        right_axis.setPen(pg.mkPen('#c8c8c8'))
+        right_axis.setTextPen(pg.mkPen('#e6e6e6'))
+        self._overlay.setXRange(0, self.win_s, padding=0)
+        self._overlay.getViewBox().sigRangeChangedManually.connect(
+            lambda *_: self._on_manual_zoom(-2))
+        self._overlay.showAxis('right')
+        self._overlay_fnirs_vb = pg.ViewBox(enableMenu=False)
+        self._overlay.scene().addItem(self._overlay_fnirs_vb)
+        self._overlay.getAxis('right').linkToView(self._overlay_fnirs_vb)
+        self._overlay_fnirs_vb.setXLink(self._overlay.getViewBox())
+        self._overlay_fnirs_vb.setMouseEnabled(x=False, y=False)
+        self._overlay.getViewBox().sigResized.connect(self._sync_overlay_viewbox)
+        self._overlay_eeg_range = (-100.0, 100.0)
+        self._overlay_fnirs_range = (-0.5, 0.5)
+        self._overlay.getViewBox().enableAutoRange(axis=pg.ViewBox.YAxis, enable=False)
+        self._overlay_fnirs_vb.enableAutoRange(axis=pg.ViewBox.YAxis, enable=False)
+        self._apply_overlay_scale()
+        self._sync_overlay_viewbox()
+        self._overlay_legend = self._overlay.addLegend(
+            offset=(12, 12), colCount=7, labelTextSize='8pt',
+            labelTextColor='#e6e6e6', brush=pg.mkBrush(0, 0, 0, 160),
+            pen=pg.mkPen('#606060'))
+        colors = (
+            '#f5d442', '#40c9ff', '#ff6b87', '#a4e05e',
+            '#c47bff', '#ff9f43', '#66e0c2', '#ff73ca', '#8aa5ff',
+            '#e8c76a', '#6ad5ff', '#c8e86b', '#ff7a65', '#a9a0ff',
+        )
+        self._overlay_curves = []
+        for i, name in enumerate(names):
+            curve = pg.PlotDataItem(pen=pg.mkPen(colors[i], width=1.5))
+            if i < self.n_eeg:
+                self._overlay.addItem(curve)
+            else:
+                self._overlay_fnirs_vb.addItem(curve)
+            self._overlay_legend.addItem(curve, name)
+            self._overlay_curves.append(curve)
+        self._overlay_tip = pg.TextItem("等待数据…", color="#b0b0b0", anchor=(0.5, 0.5))
+        self._overlay_tip.setPos(self.win_s / 2.0, 0.0)
+        self._overlay.addItem(self._overlay_tip)
+        ol.addWidget(self._overlay, 1)
+        self._stack.addWidget(self._overlay_page)
         self._stack.setCurrentWidget(self._grid_page)
+        self.view_tabs.currentChanged.connect(self._set_view_tab)
 
         # 键盘 Esc 还原 —— 仅用于「本窗口独立 show」的调试路径。
         # 主界面(ClassicMainWindow)只嵌 centralWidget, 本窗口从不 show,
@@ -392,12 +468,25 @@ class Monitor14(QtWidgets.QMainWindow):
 
     def _set_fnirs_metric(self, i: int):
         """切换 ΔHbO2/ΔHbR：整条历史曲线立即换成另一份缓冲，不等新帧覆盖。"""
-        self.show_hbo = (i == 0)
+        if self.cmb_fnirs.currentIndex() != i:
+            self.cmb_fnirs.blockSignals(True)
+            self.cmb_fnirs.setCurrentIndex(i)
+            self.cmb_fnirs.blockSignals(False)
+        show_hbo = i == 0
+        if self.show_hbo == show_hbo:
+            return
+        self.show_hbo = show_hbo
+        self._overlay.setLabel('right',
+                               'fNIRS ΔHbO2' if self.show_hbo else 'fNIRS ΔHbR',
+                               units=self.fnirs_unit)
         self._tick(force=True)   # 暂停时 force 也只重绘、不取帧（沿用既有 frozen 语义）
 
     def _toggle_ch(self, k: int, v: bool):
         self.ch_enable[k] = v
         self.plots[k].setVisible(v)
+        self._overlay_curves[k].setVisible(v)
+        if self._stack.currentWidget() is self._overlay_page:
+            self._tick(force=True)
 
     # ---- 4 路一页的分页导航 ----
     def _page_title(self, idx: int) -> str:
@@ -465,6 +554,103 @@ class Monitor14(QtWidgets.QMainWindow):
                 pass
         return super().eventFilter(obj, ev)
 
+    def _set_view_tab(self, index: int):
+        """切换分图/叠加图，保留当前时间范围和采集、暂停状态。"""
+        if self._solo is not None:
+            self._restore_grid()
+        source = (self._overlay if self._stack.currentWidget() is self._overlay_page
+                  else self.plots[self._page * PAGE_SIZE])
+        lo, hi = self._view_bounds(source)
+        overlay = index == 1
+        if overlay:
+            self._overlay.setXRange(lo, hi, padding=0)
+            self._stack.setCurrentWidget(self._overlay_page)
+            self._zoom_src = -2
+        else:
+            for plot in self.plots:
+                plot.setXRange(lo, hi, padding=0)
+            self._stack.setCurrentWidget(self._grid_page)
+            self._zoom_src = 0
+        self.btn_solo.setEnabled(not overlay)
+        self.btn_overlay_zoom.setVisible(overlay)
+        self.btn_overlay_reset.setVisible(overlay)
+        if self._follow:
+            self._recalc_x_left()
+            self._reset_x_range()
+        self._tick(force=True)
+
+    def _sync_overlay_viewbox(self):
+        left = self._overlay.getViewBox()
+        # 两个 ViewBox 的 boundingRect 都额外扩 0.5px，直接用 sceneBoundingRect
+        # 会让右侧宽 1px，时间轴末端产生几个毫秒的偏差。
+        self._overlay_fnirs_vb.setGeometry(left.geometry())
+        self._overlay_fnirs_vb.linkedViewChanged(left, self._overlay_fnirs_vb.XAxis)
+
+    def _apply_overlay_scale(self):
+        """仅在初始化或用户点 Zoom/重置时修改双纵轴，实时刷新不自动缩放。"""
+        self._overlay.setYRange(*self._overlay_eeg_range, padding=0)
+        self._overlay_fnirs_vb.setYRange(*self._overlay_fnirs_range, padding=0)
+
+    def _reset_overlay_scale(self):
+        self._overlay_eeg_range = (-100.0, 100.0)
+        self._overlay_fnirs_range = (-0.5, 0.5)
+        self._apply_overlay_scale()
+
+    @staticmethod
+    def _fit_overlay_range(values, minimum_span: float):
+        data = np.asarray(values, dtype=float).reshape(-1)
+        data = data[np.isfinite(data)]
+        if data.size == 0:
+            return None
+        low, high = np.percentile(data, (1.0, 99.0))
+        mid = float((low + high) / 2.0)
+        half = max(float((high - low) * 0.55), minimum_span / 2.0)
+        return (mid - half, mid + half)
+
+    def _zoom_overlay(self):
+        """一次性适配当前可见时间窗内的曲线，之后固定左右 Y 范围。"""
+        if self._recv < 2:
+            return
+        lo, hi = self._view_bounds(self._overlay)
+        for buf, fs, start, end, minimum, attr in (
+            (self.buf_eeg, self.fs_eeg, 0, self.n_eeg, 20.0, '_overlay_eeg_range'),
+            (self.buf_fn, self.fs_fnirs, self.n_eeg, self.n_total, 0.02,
+             '_overlay_fnirs_range'),
+        ):
+            first = max(0, int(math.floor(lo * fs)))
+            count = max(2, int(math.ceil((hi - lo) * fs)) + 2)
+            _, segment = self._take(buf, first, count, fs, int(self._recv))
+            if segment is None:
+                continue
+            rows = [segment[i - start] for i in range(start, end)
+                    if self.ch_enable[i] and self._ch_ok[i]]
+            if rows:
+                fitted = self._fit_overlay_range(np.concatenate(rows), minimum)
+                if fitted is not None:
+                    setattr(self, attr, fitted)
+        self._apply_overlay_scale()
+
+    def _paint_overlay(self, xe, seg_e, xf, seg_f, why=None):
+        visible = 0
+        for i, curve in enumerate(self._overlay_curves):
+            if not (self.ch_enable[i] and self._ch_ok[i]):
+                curve.setData([], [])
+            elif i < self.n_eeg and seg_e is not None:
+                curve.setData(xe, seg_e[i])
+                visible += 1
+            elif i >= self.n_eeg and seg_f is not None:
+                curve.setData(xf, seg_f[i - self.n_eeg])
+                visible += 1
+            else:
+                curve.setData([], [])
+        if visible:
+            self._overlay_tip.hide()
+        else:
+            self._overlay_tip.setText(
+                why or ('等待数据…' if self._recv == 0 else '当前时间窗无可见通道'))
+            lo, hi = self._view_bounds(self._overlay)
+            self._overlay_tip.setPos((lo + hi) / 2.0, 0.0)
+            self._overlay_tip.show()
     # ---- 单通道放大 / 还原 ----
     def _title_of(self, i: int) -> str:
         return self._names[i] if i < len(self._names) else f"CH{i+1}"
@@ -585,6 +771,10 @@ class Monitor14(QtWidgets.QMainWindow):
         """时间窗切换后立刻重设横轴，不然要等下一次重绘才对齐。"""
         if i < 0 or i >= len(self.WIN_CHOICES):
             return
+        if self.cmb_win.currentIndex() != i:
+            self.cmb_win.blockSignals(True)
+            self.cmb_win.setCurrentIndex(i)
+            self.cmb_win.blockSignals(False)
         self.win_s = self.WIN_CHOICES[i]
         self._recalc_x_left()
         self._reset_x_range()
@@ -621,6 +811,9 @@ class Monitor14(QtWidgets.QMainWindow):
         if hasattr(self, "_big"):
             self._big.setXRange(lo, hi, padding=0)
             self._big_tip.setPos((lo + hi) / 2.0, 0.0)
+        if hasattr(self, "_overlay"):
+            self._overlay.setXRange(lo, hi, padding=0)
+            self._overlay_tip.setPos((lo + hi) / 2.0, 0.0)
     def _set_follow(self, v: bool):
         self._follow = bool(v)
         if self._follow:
@@ -648,15 +841,23 @@ class Monitor14(QtWidgets.QMainWindow):
         -6~17 / -20~70 / 1~9 / 8.8~9.8 就是这条路径漏掉的结果。
         """
         big = getattr(self, "_big", None)
+        overlay = getattr(self, "_overlay", None)
         targets = list(self.plots) + ([big] if big is not None else [])
+        if overlay is not None:
+            targets.append(overlay)
         if not targets:
             return
         if src == -1 and big is not None:
             ref = big
+        elif src == -2 and overlay is not None:
+            ref = overlay
         elif isinstance(src, int) and 0 <= src < len(self.plots):
             ref = self.plots[src]
         else:
-            ref = big if (self._solo is not None and big is not None) else targets[0]
+            ref = (big if (self._solo is not None and big is not None) else
+                   overlay if (overlay is not None and
+                               self._stack.currentWidget() is self._overlay_page) else
+                   self.plots[self._page * PAGE_SIZE])
         v0, v1 = self._view_bounds(ref)
         if v0 < 0.0:
             v1 -= v0                       # 整体右移，保持用户选的窗宽
@@ -677,6 +878,10 @@ class Monitor14(QtWidgets.QMainWindow):
         if self._solo is not None:
             self._set_left_label(self._big, self._solo)
             self._lbl_solo.setText(self._solo_header(self._solo))
+        self._overlay.setLabel('left', 'EEG', units=self.eeg_unit)
+        self._overlay.setLabel('right',
+                               'fNIRS ΔHbO2' if self.show_hbo else 'fNIRS ΔHbR',
+                               units=self.fnirs_unit)
     @staticmethod
     def _robust_span(row):
         """一段样本 -> (中心, 半幅)，用分位数定量程，单个毛刺不参与。
@@ -1141,6 +1346,9 @@ class Monitor14(QtWidgets.QMainWindow):
         self.buf_hbo[:] = 0.0
         self.buf_hbr[:] = 0.0
         self.buf_raw[:] = 0.0
+        for curve in self._overlay_curves:
+            curve.setData([], [])
+        self._reset_overlay_scale()
         self._seq_last = -1
         self._lost = 0
         self._recv = 0
@@ -1247,14 +1455,16 @@ class Monitor14(QtWidgets.QMainWindow):
             # 旧代码只有拿到数据才同步，等待连接时拖一下就会出现四种横轴。
             if not self._follow:
                 self._unify_time_axis()
+            self._paint_overlay(None, None, None, None, '等待数据…')
             return
         # 画哪一段样本：跟随时取最近一窗；手动缩放过就按当前视图范围取。
         # 以前固定只取 win*fs 点，缩出去只能看到"一段 10 秒的短线"，
         # 前面几十秒明明还在缓冲里，却是一片空白（现场当成"前面的数据没了"）。
         fe = max(self.fs_eeg, 1e-6); ff = max(self.fs_fnirs, 1e-6)
         recv = int(self._recv)
-        ref = self._big if self._solo is not None else self.plots[
-            self._zoom_src if 0 <= self._zoom_src < self.n_total else 0]
+        ref = (self._big if self._solo is not None else
+               self._overlay if self._stack.currentWidget() is self._overlay_page else
+               self.plots[self._zoom_src if 0 <= self._zoom_src < self.n_total else 0])
         if self._follow:
             c_e = min(recv, int(self.win_s*fe)); i0_e = recv - c_e
             c_f = min(recv, int(self.win_s*ff)); i0_f = recv - c_f
@@ -1268,7 +1478,7 @@ class Monitor14(QtWidgets.QMainWindow):
                                         max(MIN_SPAN_S, 2.0 / fe))
             # 14 张图统一到这一段（合同 S1「时间轴统一」）：缩一张，其余跟着走，
             # 否则别的子图还停在旧窗口，同一时刻看的是不同时间段的数据。
-            for p in self.plots + [self._big]:
+            for p in self.plots + [self._big, self._overlay]:
                 a, b = self._view_bounds(p)
                 if abs(a - v0) > 1e-6 or abs(b - v1) > 1e-6:
                     p.setXRange(v0, v1, padding=0)
@@ -1284,7 +1494,7 @@ class Monitor14(QtWidgets.QMainWindow):
                 i0_f, c_f = recv - 2, 2
         xe, seg_e = self._take(self.buf_eeg, i0_e, c_e, fe, recv)
         xf, seg_f = self._take(self.buf_fn, i0_f, c_f, ff, recv)
-        if self.eeg_scale_auto:
+        if self.eeg_scale_auto and self._stack.currentWidget() is not self._overlay_page:
             # 量程基准固定取"最近一窗"，不看横轴缩放到哪里（详见 _auto_eeg_scale）。
             # 单通道放大时只按这一路算：放大就是要看它自己的细节，拿 14 路里最大的
             # 那一路定档，小信号会被压成一条线（这正是上一版的问题）。
@@ -1299,6 +1509,9 @@ class Monitor14(QtWidgets.QMainWindow):
                     view = None if view is None else view[self._solo:self._solo + 1]
                 self._auto_eeg_scale(seg_base, view)
         if seg_e is None and seg_f is None:
+            if self._stack.currentWidget() is self._overlay_page:
+                self._paint_overlay(None, None, None, None, '超出缓冲范围')
+                return
             # 两端都取不到才整屏清空。旧写法是"一边取不到就全清"：fNIRS 缓冲只
             # 3000 点（500 Hz 下 6 s），缩到 6 s 以前那段时 seg_f 为 None，
             # 于是 CH1 明明有 30 s 数据也被一起抹掉 —— 现场就是"放大以后数据没了"。
@@ -1314,6 +1527,9 @@ class Monitor14(QtWidgets.QMainWindow):
         if self._follow:
             self._recalc_x_left()
             self._reset_x_range()
+        if self._stack.currentWidget() is self._overlay_page:
+            self._paint_overlay(xe, seg_e, xf, seg_f)
+            return
         # 网格页的 14 张图。EEG / fNIRS 各画各的：一边的缓冲覆盖不到，只清这一边，
         # 另一边的曲线照画（这就是上面说的"整屏消失"的修法）。
         why_fn = "超出缓冲（仅存最近 %.0f s）" % (self.buf_fn.shape[1] / ff)

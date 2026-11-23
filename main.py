@@ -1,7 +1,8 @@
 """上位机统一入口(源码运行与PyInstaller打包共用).
 
 数据源与链路(任一组合):
-  python main.py --source=real --proto=udp --port=5000     # 切到无线输出时: 模组 UDP 透传
+  python main.py --source=real --proto=udp --target-ip=192.168.3.140 --port=5000
+                                                          # 当前 ESP 固件: HELLO/测试包/START/100B EEG
   python main.py --source=real --proto=tcp --port=5000     # 模组 TCP Client, 主动连本机
   python main.py --source=real --proto=tcp-client --host=192.168.4.1 --port=8080
                                                           # 模组 TCP Server, 本机主动连
@@ -142,7 +143,8 @@ def main() -> None:
 
     opts = parse_argv(sys.argv[1:], base=_load_run_config())
     log(f"启动: source={opts['source']} proto={opts['proto']} port={opts['port']} "
-        f"host={opts['host']} com={opts['com']} baud={opts['baud']} raw_dump={opts['raw_dump']} "
+        f"host={opts['host']} target_ip={opts['target_ip']} "
+        f"com={opts['com']} baud={opts['baud']} raw_dump={opts['raw_dump']} "
         f"protocol={opts['protocol']} eeg_gain={opts['eeg_gain']} eeg_vref={opts['eeg_vref']} "
         f"eeg_preamp_gain={opts.get('eeg_preamp_gain')}")
 
@@ -153,7 +155,8 @@ def main() -> None:
     try:
         src = make_source(
             opts["source"], port=opts["port"], proto=opts["proto"], path=opts["replay"],
-            host=opts["host"], com=opts["com"], baud=opts["baud"],
+            host=opts["host"], target_ip=opts["target_ip"],
+            com=opts["com"], baud=opts["baud"],
             raw_dump=opts["raw_dump"],
             protocol=opts["protocol"], eeg_gain=opts["eeg_gain"], eeg_vref=opts["eeg_vref"],
             eeg_preamp_gain=opts.get("eeg_preamp_gain"),
