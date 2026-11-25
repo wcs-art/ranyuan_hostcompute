@@ -9,6 +9,7 @@ from frame_slicer import FrameSlicer
 
 FRAME_HEAD = b"\xAA\x55"
 PROTO_VER = 1
+FW100_VERSIONS = (1, 2)  # 01=单板暗场；02=十个光学 S-D 槽，帧长均为 100 B
 
 #: flags 位定义
 FLAG_FNIRS_NEW = 0x01
@@ -242,11 +243,13 @@ class DataFrame:
     eeg_raw: list[int] = field(default_factory=list)           # 原始码值，现场核对用
     eeg_uv_all: list[float] = field(default_factory=list)      # ratio>1 时本帧全部样点
     header_ok: bool = True                                     # 帧头通道数与配置是否一致
+    fw100: bool = False
 
     @property
     def fnirs_is_new(self) -> bool:
         """本帧 fNIRS 是否为新采样（双速率时只有部分帧有效）。"""
-        return bool(self.flags & FLAG_FNIRS_NEW) or self.ratio <= 1
+        return bool(self.flags & FLAG_FNIRS_NEW) if self.fw100 else \
+               (bool(self.flags & FLAG_FNIRS_NEW) or self.ratio <= 1)
 
 
 def crc16_modbus(data: bytes) -> int:
@@ -328,7 +331,7 @@ def _parse_frame(raw: bytes, ly: FrameLayout) -> DataFrame:
         seq, ts, ts_abs = struct.unpack("<IIQ", body[3:19])
         n_eeg, n_fnirs, n_wl, ratio = ly.n_eeg, ly.n_fnirs, ly.n_wl, 1
         p = 19
-        header_ok = ver == PROTO_VER
+        header_ok = ver in FW100_VERSIONS if ly.name == "fw100" else ver == PROTO_VER
     else:
         dev, seq, ts = struct.unpack("<BII", body[:9])
         ver, n_eeg, n_fnirs, n_wl, ratio, flags, ts_abs = 0, ly.n_eeg, ly.n_fnirs, ly.n_wl, 1, 0, 0
@@ -354,6 +357,7 @@ def _parse_frame(raw: bytes, ly: FrameLayout) -> DataFrame:
         event_type=ev_t, event_ts=ev_ts, crc_ok=crc_ok,
         timestamp_abs_ms=ts_abs, proto_ver=ver, ratio=ratio, flags=flags,
         eeg_raw=eeg_raw, eeg_uv_all=uv_all, header_ok=header_ok,
+        fw100=ly.name == "fw100",
     )
 
 

@@ -148,24 +148,32 @@ def main() -> None:
         f"protocol={opts['protocol']} eeg_gain={opts['eeg_gain']} eeg_vref={opts['eeg_vref']} "
         f"eeg_preamp_gain={opts.get('eeg_preamp_gain')}")
 
+    # 未指定控制串口时交给界面选实际设备，不再尝试旧机器上的固定 COM 编号。
+    needs_com = (opts["source"] == "real" and opts["proto"] in ("serial", "uart", "com", "udp")) or \
+                opts["source"] in ("serial", "uart", "com", "text", "serial-text", "firewater")
+    no_control_port = needs_com and not str(opts.get("com") or "").strip()
+    if no_control_port:
+        log("未预设控制串口：请在界面刷新端口、选择实际 COM 口后点击连接并采集")
+
     # 链路打不开不等于程序要退出: 现场最常见的是"线还没插/插错口/被别的工具占着",
     # 此时最需要的是界面照常打开, 让人能在里面改端口重试, 而不是闪退加一个弹窗。
     src = None
     start_err = None
-    try:
-        src = make_source(
-            opts["source"], port=opts["port"], proto=opts["proto"], path=opts["replay"],
-            host=opts["host"], target_ip=opts["target_ip"],
-            com=opts["com"], baud=opts["baud"],
-            raw_dump=opts["raw_dump"],
-            protocol=opts["protocol"], eeg_gain=opts["eeg_gain"], eeg_vref=opts["eeg_vref"],
-            eeg_preamp_gain=opts.get("eeg_preamp_gain"),
-        )
-    except SystemExit:
-        raise                      # 参数本身写错(如 --source=dry 缺 --replay), 该报错就报错
-    except Exception as e:  # noqa: BLE001 - 链路失败要给现场一句话原因
-        start_err = str(e)
-        log(f"[WARN] 数据源创建失败: {e} —— 窗口照常打开, 请手动选择链路")
+    if not no_control_port:
+        try:
+            src = make_source(
+                opts["source"], port=opts["port"], proto=opts["proto"], path=opts["replay"],
+                host=opts["host"], target_ip=opts["target_ip"],
+                com=opts["com"], baud=opts["baud"],
+                raw_dump=opts["raw_dump"],
+                protocol=opts["protocol"], eeg_gain=opts["eeg_gain"], eeg_vref=opts["eeg_vref"],
+                eeg_preamp_gain=opts.get("eeg_preamp_gain"),
+            )
+        except SystemExit:
+            raise                      # 参数本身写错(如 --source=dry 缺 --replay), 该报错就报错
+        except Exception as e:  # noqa: BLE001 - 链路失败要给现场一句话原因
+            start_err = str(e)
+            log(f"[WARN] 数据源创建失败: {e} —— 窗口照常打开, 请手动选择链路")
 
     if src is not None and opts["source"] == "dry" and opts["headless"]:
         raise SystemExit(_run_dry_headless(src))

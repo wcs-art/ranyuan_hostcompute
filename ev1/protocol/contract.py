@@ -44,6 +44,8 @@ class Frame:
     event_type: int = 0
     event_ts: int = 0
     crc_ok: bool = False
+    fnirs_version: int = 0                # 固件 fw100: 1=暗场, 2=光学；0=其它来源
+    fnirs_new: bool = False               # 固件 flags bit0；填零帧不是新采样
 
 
 # --------------------------------------------------------------------------
@@ -122,6 +124,8 @@ def from_protocol(df: Any, t_host_s: Optional[float] = None) -> Frame:
         event_type=getattr(df, "event_type", 0),
         event_ts=getattr(df, "event_ts", 0),
         crc_ok=bool(getattr(df, "crc_ok", False)),
+        fnirs_version=int(getattr(df, "proto_ver", 0)) if getattr(df, "fw100", False) else 0,
+        fnirs_new=bool(getattr(df, "flags", 0) & 1),
     )
 
 
@@ -134,6 +138,9 @@ def frame_to_ui_dict(fr: Frame) -> dict:
     tests/test_contract.py 用 ast 解析 push_frame 签名做交叉校验:
     本函数改了键、或 push_frame 改了形参名, 测试立刻红。
     """
+    raw = _flatten_raw(fr.fnirs_raw)
+    if fr.fnirs_version and not fr.fnirs_new:
+        raw = None
     return {
         "device_id": int(fr.device_id),
         "seq": fr.seq,
@@ -144,7 +151,9 @@ def frame_to_ui_dict(fr: Frame) -> dict:
         "eeg_n": len(fr.eeg_uv),
         "hbo": list(fr.hbo) if fr.hbo is not None else [0.0] * N_FNIRS,
         "hbr": list(fr.hbr) if fr.hbr is not None else [0.0] * N_FNIRS,
-        "raw": _flatten_raw(fr.fnirs_raw),
+        "raw": raw,
+        "fnirs_version": fr.fnirs_version,
+        "fnirs_new": fr.fnirs_new,
         "battery": fr.battery_pct,
         "acc_xyz": list(fr.acc_xyz) if fr.acc_xyz is not None else None,
         "gyro_xyz": list(fr.gyro_xyz) if fr.gyro_xyz is not None else None,

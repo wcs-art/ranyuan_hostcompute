@@ -85,6 +85,8 @@ class Monitor14(QtWidgets.QMainWindow):
         # 轴单位: 二进制链路是折算后的 μV / mM; 文本链路的单位还没确认, 只能标"原始值"
         self.eeg_unit = "μV"
         self.fnirs_unit = "mM"
+        self.fnirs_version = 0  # fw100: 1=暗场通道，2=光学 S-D 槽
+        self._fw_fnirs_latest = np.full((10, 2), np.nan)
         # 自动改范围(时间轴滚动+量程)的开关。用户一旦手动缩放就关掉,
         # 否则每 40ms 被 setXRange/setYRange 抢回去, "支持缩放"等于没有。
         self._follow = True
@@ -476,9 +478,7 @@ class Monitor14(QtWidgets.QMainWindow):
         if self.show_hbo == show_hbo:
             return
         self.show_hbo = show_hbo
-        self._overlay.setLabel('right',
-                               'fNIRS ΔHbO2' if self.show_hbo else 'fNIRS ΔHbR',
-                               units=self.fnirs_unit)
+        self._apply_axis_labels()
         self._tick(force=True)   # 暂停时 force 也只重绘、不取帧（沿用既有 frozen 语义）
 
     def _toggle_ch(self, k: int, v: bool):
@@ -674,9 +674,10 @@ class Monitor14(QtWidgets.QMainWindow):
                 plot.setLabel('left', 'EEG', units=self.eeg_unit)
         else:
             if short:
-                plot.setLabel('left', 'ΔHbO2·ΔHbR')
+                plot.setLabel('left', 'fNIRS 原始码' if self.fnirs_version else 'ΔHbO2·ΔHbR')
             else:
-                plot.setLabel('left', 'ΔHbO2/ΔHbR', units=self.fnirs_unit)
+                plot.setLabel('left', '差分码 波长1/2' if self.fnirs_version else 'ΔHbO2/ΔHbR',
+                              units=self.fnirs_unit)
         self._style_axes(plot)
 
     @staticmethod
@@ -880,7 +881,9 @@ class Monitor14(QtWidgets.QMainWindow):
             self._lbl_solo.setText(self._solo_header(self._solo))
         self._overlay.setLabel('left', 'EEG', units=self.eeg_unit)
         self._overlay.setLabel('right',
-                               'fNIRS ΔHbO2' if self.show_hbo else 'fNIRS ΔHbR',
+                               (f'fNIRS 0{self.fnirs_version} 原始码 波长{1 if self.show_hbo else 2}'
+                                if self.fnirs_version else
+                                ('fNIRS ΔHbO2' if self.show_hbo else 'fNIRS ΔHbR')),
                                units=self.fnirs_unit)
     @staticmethod
     def _robust_span(row):
@@ -1074,10 +1077,17 @@ class Monitor14(QtWidgets.QMainWindow):
              else max(0.0, t_sample - self._t_sampling0))
         n_inten = contract.N_FNIRS*len(contract.FNIRS_WLS)
         raw20 = [float(v) for v in (raw or [])][:n_inten]
-        raw20 += [0.0]*(n_inten-len(raw20))
+        raw20 += [float("nan") if self.fnirs_version else 0.0] * (n_inten-len(raw20))
+        if self.fnirs_version == 1:
+            raw20[12:] = [float("nan")] * 8  # 01 的后四槽不是物理采样
+            for channel in range(6):
+                if not self._ch_ok[self.n_eeg + channel]:
+                    raw20[2*channel:2*channel+2] = [float("nan")] * 2
 
         def _by_ch(vals):
             """定长 10 路; 质控判异常的通道写 None -> CSV 空串(不写 0 冒充结果)。"""
+            if vals is None:
+                return [None] * contract.N_FNIRS
             v = [float(x) for x in (vals or [])][:contract.N_FNIRS]
             v += [0.0]*(contract.N_FNIRS-len(v))
             m = getattr(self, "_last_mask", None)
@@ -1093,7 +1103,8 @@ class Monitor14(QtWidgets.QMainWindow):
             t_host_s=t, t_abs_ms=int(ts_abs_ms or 0),
             eeg_uv=[float(v) for v in (eeg_uv or [])],
             fnirs_raw=contract.unnest_raw(raw20),
-            fnirs_intensity=[round(v*self.lux_per_lsb, 4) for v in raw20],
+            fnirs_intensity=(None if self.fnirs_version else
+                             [round(v*self.lux_per_lsb, 4) for v in raw20]),
             od=list(getattr(self, "_last_od", None) or []) or None,   # 已建基线即写真值
             hbo=_by_ch(hbo),
             hbr=_by_ch(hbr),
@@ -1164,6 +1175,10 @@ class Monitor14(QtWidgets.QMainWindow):
 
     def fnirs_state(self) -> str:
         """状态栏用的 fNIRS 计算状态, 用于区分"没数据"和"没算完"。"""
+        if self.fnirs_version:
+            valid = sum(self._ch_ok[self.n_eeg:])
+            kind = "单板暗场" if self.fnirs_version == 1 else "十槽光学"
+            return f"0{self.fnirs_version} {kind} 原始码 {valid}/{6 if self.fnirs_version == 1 else 10}（非血红蛋白浓度）"
         if self._base_rows is None:
             return f"基线 {len(self._base_buf)}/{self.n_baseline}"
         bits = []
@@ -1174,8 +1189,46 @@ class Monitor14(QtWidgets.QMainWindow):
         return f"正常({'、'.join(bits)})" if bits else "正常"
 
     def push_frame(self, seq, eeg_uv, hbo, hbr, raw=None, battery=-1.0, acc_xyz=None, gyro_xyz=None,
-                   ts_abs_ms=0, event_type=0, event_ts=0, device_id=1, eeg_n=None, t_dev_ms=None):
+                   ts_abs_ms=0, event_type=0, event_ts=0, device_id=1, eeg_n=None, t_dev_ms=None,
+                   fnirs_version=0, fnirs_new=False):
         self._t_rx = time.time()
+        firmware_fnirs = fnirs_version in (1, 2)
+        if firmware_fnirs and self.fnirs_version != fnirs_version:
+            self.fnirs_version = fnirs_version
+            self.fnirs_unit = "ADC码"
+            self._fw_fnirs_latest[:] = np.nan
+            self.buf_hbo[:] = np.nan
+            self.buf_hbr[:] = np.nan
+            self._ch_ok[self.n_eeg:] = [False] * 10
+            self._base_buf = []
+            self._base_rows = None
+            self._last_od = None
+            self._last_hbt = None
+            self._last_sto2 = None
+            self._last_mask = None
+            self.cmb_fnirs.setItemText(0, "原始码·波长1")
+            self.cmb_fnirs.setItemText(1, "原始码·波长2")
+            self._apply_axis_labels()
+        if firmware_fnirs:
+            if fnirs_new and raw is not None:
+                values = np.asarray(raw, dtype=float).reshape(10, 2)
+                if fnirs_version == 1:
+                    values[6:] = np.nan  # 01 的槽 7～10 是占位，不是采样
+                self._fw_fnirs_latest[:] = values
+                if fnirs_version == 1:
+                    # 01 没有逐板有效位；不显示未启动座子填充的全零平线。
+                    self._ch_ok[self.n_eeg:self.n_eeg + 6] = \
+                        np.any(values[:6] != 0, axis=1).tolist()
+                else:
+                    self._ch_ok[self.n_eeg:] = [True] * 10
+                active = values[np.asarray(self._ch_ok[self.n_eeg:], dtype=bool)]
+                finite = active[np.isfinite(active)]
+                fitted = self._fit_overlay_range(finite, 20.0) if finite.size else None
+                if fitted is not None:
+                    self._overlay_fnirs_range = fitted
+                    self._overlay_fnirs_vb.setYRange(*fitted, padding=0)
+            hbo = self._fw_fnirs_latest[:, 0].tolist()
+            hbr = self._fw_fnirs_latest[:, 1].tolist()
         # 采样时刻：设备单调毫秒 > 设备绝对毫秒 > 本地等间隔合成。
         # 设备复位会让单调毫秒跳变，回退到合成时间，绝不在 CSV 里留下倒退的时间轴。
         self._t_synth += 1.0 / max(1.0, float(self.fs_eeg))
@@ -1192,7 +1245,7 @@ class Monitor14(QtWidgets.QMainWindow):
         n_ok = self.n_eeg if eeg_n is None else max(0, min(int(eeg_n), self.n_eeg))
         for i in range(n_ok):
             self._ch_ok[i] = True
-        if raw is not None:
+        if raw is not None and not firmware_fnirs:
             for i in range(10):
                 self._ch_ok[self.n_eeg + i] = True
         if device_id is not None:
@@ -1213,7 +1266,7 @@ class Monitor14(QtWidgets.QMainWindow):
         if battery >= 0: self.battery_pct = float(battery)
         self.buf_eeg = np.roll(self.buf_eeg, -1, axis=1); self.buf_eeg[:, -1] = eeg_uv
         # 有真实光强就用真实值算 ΔHbO/ΔHbR; 算不出来(基线未建完/坏道)沿用入参(通常为 0)
-        _d = self._derive_fnirs(raw)
+        _d = None if firmware_fnirs else self._derive_fnirs(raw)
         if _d is not None:
             hbo, hbr, self._last_od = _d
         # 两份浓度缓存都按绝对样本序号环形写入，切换指标时历史立刻可用。
@@ -1232,7 +1285,9 @@ class Monitor14(QtWidgets.QMainWindow):
             if hasattr(self, "motion_panel"):
                 try: self.motion_panel.push(np.array(ax), np.array(gx))
                 except Exception: pass
-        self._rec_row(seq, eeg_uv, hbo, hbr, acc_xyz, gyro_xyz, raw=raw, battery=battery,
+        self._rec_row(seq, eeg_uv, None if firmware_fnirs else hbo,
+                      None if firmware_fnirs else hbr, acc_xyz, gyro_xyz,
+                      raw=raw, battery=battery,
                       ts_abs_ms=ts_abs_ms, event_type=event_type, event_ts=event_ts,
                       t_sample=t_sample)
         # S9: 全部由现有EEG/fNIRS算出, ≥1Hz刷新 (每25帧≈1Hz), 推面板+存CSV/XDF
@@ -1269,14 +1324,16 @@ class Monitor14(QtWidgets.QMainWindow):
             from quality import eeg_contact, fnirs_flags, fnirs_levels
             try:
                 self.eeg_quality = eeg_contact(self.buf_eeg[:, -500:])
-                # buf_raw 是 20 行(10 通道 × 2 波长), 而 S3 判的是 10 个通道 ——
-                # 直接把 20 行喂进去会得到 20 个状态, 界面上的通道号就对不上实物。
-                r = self.buf_raw[:, -50:]
-                if r.shape[0] == contract.N_FNIRS * len(contract.FNIRS_WLS):
-                    r = r.reshape(contract.N_FNIRS, len(contract.FNIRS_WLS), -1).mean(axis=1)
-                self.fnirs_quality = fnirs_flags(r)
-                # S3 终版要求"暗噪声基线显示"：函数早就在 quality.py 里，之前没人调用。
-                self._fnirs_levels = fnirs_levels(r)
+                if firmware_fnirs:
+                    self.fnirs_quality = ["未标定"] * 10
+                    self._fnirs_levels = []
+                else:
+                    # 质控按十个通道计算，两个波长先取均值。
+                    r = self.buf_raw[:, -50:]
+                    if r.shape[0] == contract.N_FNIRS * len(contract.FNIRS_WLS):
+                        r = r.reshape(contract.N_FNIRS, len(contract.FNIRS_WLS), -1).mean(axis=1)
+                    self.fnirs_quality = fnirs_flags(r)
+                    self._fnirs_levels = fnirs_levels(r)
                 self._quality_error = ""
             except Exception as e:
                 self._quality_err_n = getattr(self, "_quality_err_n", 0) + 1
@@ -1346,6 +1403,11 @@ class Monitor14(QtWidgets.QMainWindow):
         self.buf_hbo[:] = 0.0
         self.buf_hbr[:] = 0.0
         self.buf_raw[:] = 0.0
+        self.fnirs_version = 0
+        self.fnirs_unit = "mM"
+        self._fw_fnirs_latest[:] = np.nan
+        self.cmb_fnirs.setItemText(0, "ΔHbO2")
+        self.cmb_fnirs.setItemText(1, "ΔHbR")
         for curve in self._overlay_curves:
             curve.setData([], [])
         self._reset_overlay_scale()
@@ -1701,7 +1763,14 @@ class Monitor14(QtWidgets.QMainWindow):
                 # 手动档: 保持 ±量程 的绝对语义, 不跟随信号漂移
                 plot.setYRange(-self.eeg_scale, self.eeg_scale, padding=0)
         else:
-            plot.setYRange(-self.fnirs_scale, self.fnirs_scale, padding=0)
+            if self.fnirs_version:
+                rs = self._robust_span(y)
+                finite = np.asarray(y)[np.isfinite(y)]
+                mid = rs[0] if rs is not None else (float(np.median(finite)) if finite.size else 0.0)
+                half = max(rs[1] * 1.1 if rs is not None else 0.0, 10.0)
+                plot.setYRange(mid - half, mid + half, padding=0)
+            else:
+                plot.setYRange(-self.fnirs_scale, self.fnirs_scale, padding=0)
         self._mark_grid_ticks(plot)
 
     def _mark_grid_ticks(self, plot):

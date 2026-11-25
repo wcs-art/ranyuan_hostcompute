@@ -14,7 +14,7 @@
   "port": 5000,
   "host": "0.0.0.0",
   "target_ip": "",
-  "com": "COM18",
+  "com": "",
   "baud": 921600,
   "raw_dump": "capture/field.bin",
   "protocol": "fw100",

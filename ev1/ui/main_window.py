@@ -167,6 +167,7 @@ class ClassicMainWindow(QtWidgets.QMainWindow):
                            ("TCP 服务端", "tcp-client"),
                            ("模拟数据 (仅自检)", "sim")):
             self.cmb_src.addItem(label, key)
+        self.cmb_src.setCurrentIndex(self.cmb_src.findData("serial"))
         self.cmb_com = QtWidgets.QComboBox(); self.cmb_com.setEditable(True)
         self.cmb_com.setMinimumWidth(90)
         self.cmb_baud = QtWidgets.QComboBox(); self.cmb_baud.setEditable(True)
@@ -589,6 +590,9 @@ class ClassicMainWindow(QtWidgets.QMainWindow):
 
     def _tick_proxy(self):
         self.mon._tick()
+        if self.cmb_fnirs.itemText(0) != self.mon.cmb_fnirs.itemText(0):
+            for i in (0, 1):
+                self.cmb_fnirs.setItemText(i, self.mon.cmb_fnirs.itemText(i))
         # S2: 只要有CSV就保持导出可用 (修"导出按钮没反应": 内外两套记录按钮不同步)
         try:
             if getattr(self.mon, "_csv_path", None) and not self.btn_export.isEnabled():

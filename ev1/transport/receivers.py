@@ -20,6 +20,10 @@ class LinkError(RuntimeError):
     """链路打开失败。message 是给现场看的中文原因。"""
 
 
+class ChargeLockError(LinkError):
+    """固件明确拒绝 EEG 传输，因为充电禁传正在生效。"""
+
+
 def _send_eeg_command(ser, command: str, expected: bytes, timeout_s: float) -> None:
     """在 USART1 上发文本命令并确认固件回复，跳过可能混入的二进制帧。"""
     ser.reset_input_buffer()
@@ -34,11 +38,30 @@ def _send_eeg_command(ser, command: str, expected: bytes, timeout_s: float) -> N
         received.extend(chunk)
         if expected in received:
             return
+        if b"ERR EEG UART blocked by charge lock" in received or \
+                b"ERR EEG OUTPUT UDP result=6" in received:
+            raise ChargeLockError("充电禁传正在生效")
         if b"ERR EEG OUTPUT" in received:
             tail = received.split(b"ERR EEG OUTPUT", 1)[1].split(b"\n", 1)[0]
             raise LinkError(f"固件拒绝 {command}: ERR EEG OUTPUT{tail.decode('ascii', 'replace')}")
+        if b"ERR CHARGE OFF result=" in received or b"OK CHARGE OFF result=8" in received:
+            line = received.split(b"CHARGE OFF result=", 1)[1].split(b"\n", 1)[0].strip()
+            raise LinkError(f"CHARGE OFF 未实际生效 (result={line.decode('ascii', 'replace')})；请检查电源管理芯片")
         del received[:-4096]
     raise LinkError(f"{command} 已发送，但 {timeout_s:g}s 内没有收到固件确认；请检查控制串口和波特率")
+
+
+def _start_eeg_with_charge_unlock(ser, command: str, expected: bytes,
+                                  timeout_s: float) -> None:
+    """只在固件明确报告充电禁传时关闭充电，并确认应用后重试。"""
+    try:
+        _send_eeg_command(ser, command, expected, timeout_s)
+    except ChargeLockError:
+        _send_eeg_command(ser, "CHARGE OFF", b"OK CHARGE OFF result=0", 3.0)
+        try:
+            _send_eeg_command(ser, command, expected, timeout_s)
+        except ChargeLockError as exc:
+            raise LinkError("已发送 CHARGE OFF，但固件仍禁止 EEG 传输；请检查 BAT READ 和电源状态") from exc
 
 
 def request_eeg_udp_mode(com: str, baud: int) -> None:
@@ -49,7 +72,8 @@ def request_eeg_udp_mode(com: str, baud: int) -> None:
         raise LinkError("切换 UDP 模式需要 pyserial，请安装 pyserial") from exc
     try:
         with serial.Serial(com, baud, timeout=0.2, write_timeout=2) as ser:
-            _send_eeg_command(ser, "EEG OUTPUT UDP", b"OK EEG OUTPUT UDP result=0", 8.0)
+            _start_eeg_with_charge_unlock(
+                ser, "EEG OUTPUT UDP", b"OK EEG OUTPUT UDP result=0", 8.0)
     except LinkError:
         raise
     except Exception as exc:
@@ -482,6 +506,7 @@ class SerialReceiver(_ByteReceiver):
         self.com = com
         self.baud = int(baud)
         self._ser = None
+        self._status_tail = b""
         #: 断线后自动重连的间隔(秒)
         self.retry_s = float(retry_s)
 
@@ -510,7 +535,7 @@ class SerialReceiver(_ByteReceiver):
             raise LinkError(f"{why} 原始错误: {raw}") from e
         try:
             _send_eeg_command(ser, "EEG OUTPUT UART", b"OK EEG OUTPUT UART result=0", 3.0)
-            _send_eeg_command(ser, "EEG UART ON", b"OK EEG UART ON", 3.0)
+            _start_eeg_with_charge_unlock(ser, "EEG UART ON", b"OK EEG UART ON", 3.0)
         except Exception as exc:
             ser.close()
             if isinstance(exc, LinkError):
@@ -522,6 +547,7 @@ class SerialReceiver(_ByteReceiver):
         if self.running:  # 幂等: 入口与界面可能各调一次
             return
         self._ser = self._open()      # 启动即失败要同步抛出, 现场才能弹窗看见原因
+        self._status_tail = b""
         self.running = True
         self.error = None
         threading.Thread(target=self._supervise, args=(self._ser,),
@@ -532,6 +558,10 @@ class SerialReceiver(_ByteReceiver):
             n = ser.in_waiting or 1
             d = ser.read(min(n, self.bufsize))
             if d:
+                status = self._status_tail + d
+                if b"CHARGE LOCK: EEG TX disabled" in status:
+                    self.error = "固件已触发充电禁传并停发 EEG；断开后重新连接以关闭充电并恢复采集"
+                self._status_tail = status[-64:]
                 self._push(d)
 
     def _supervise(self, ser) -> None:
